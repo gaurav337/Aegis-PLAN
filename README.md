@@ -103,7 +103,7 @@ specific tool evidence.
 | 🫀 **Biological Signal Detection** | Extracts pulse (rPPG) and corneal reflections to verify physical presence |
 | 🔬 **Frequency-Domain Forensics** | Hand-crafted DCT analysis + FreqNet transformer — both operating in frequency space, covering what the other misses |
 | 📐 **Geometric Physics Analysis** | 7-point facial landmark geometry check based on anthropometric constraints — catches what neural networks miss |
-| 💡 **Illumination Physics Analysis** | Detects face-scene lighting mismatches using Shape-from-Shading — especially effective against diffusion models |
+| 🌅 **Illumination Physics Analysis** | Detects face-scene lighting mismatches using Shape-from-Shading — especially effective against diffusion models |
 | 🧩 **Generator-Agnostic SBI Detection** | Trained on blend boundaries rather than generator fingerprints — detects face-swaps from generators it has never seen |
 
 ---
@@ -239,6 +239,8 @@ ollama run phi3:mini "Explain what a deepfake is in one sentence."
 | **Source** | Microsoft |
 
 ---
+
+> ⚠️ **Note:** The download paths below are examples. Verify current model availability on HuggingFace Hub before running. See linked papers for official model releases.
 
 #### 2. CLIP + Forensic Adapter — 352 MB
 
@@ -387,107 +389,162 @@ LLM Agent decides:
 (Dynamic, evidence-driven)
 ```
 
-### The Agent Loop
+### The Agent Loop (Behavioural State & VRAM Lifecycle)
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE : System starts\nOllama running in background
+
+    IDLE --> PREPROCESSING : File uploaded\nEvent: analyze()
+
+    state PREPROCESSING {
+        [*] --> FaceDetect
+        FaceDetect --> LandmarkExtract : Face found
+        FaceDetect --> ImageOnlyMode : No face detected
+        LandmarkExtract --> PatchExtract
+        PatchExtract --> [*]
+        ImageOnlyMode --> [*]
+    }
+
+    PREPROCESSING --> CPU_PHASE : Preprocessing complete\nVRAM used: 0 GB
+
+    state CPU_PHASE {
+        [*] --> C2PA_State
+        C2PA_State --> RPPG_State : Not signed
+        C2PA_State --> [*] : Signed — early exit
+        RPPG_State --> DCT_State : Video only
+        DCT_State --> GEO_State
+        GEO_State --> ILLUM_State
+        ILLUM_State --> [*]
+        note right of RPPG_State : Output: liveness bool\nNO BPM reported
+        note right of GEO_State : Output: violations list\n7 anthropometric checks
+    }
+
+    CPU_PHASE --> CONFIDENCE_CHECK_1 : All CPU tools done\nVRAM still: 0 GB
+
+    state CONFIDENCE_CHECK_1 <<choice>>
+    CONFIDENCE_CHECK_1 --> SYNTHESIS : confidence > 0.85\nEarly stopping triggered
+    CONFIDENCE_CHECK_1 --> GPU_PHASE : confidence ≤ 0.85\nNeed more evidence
+
+    state GPU_PHASE {
+        [*] --> CLIP_Load
+        CLIP_Load --> CLIP_Infer : VRAM: +600MB
+        CLIP_Infer --> CLIP_Unload
+        CLIP_Unload --> SBI_Load : del model\nempty_cache()\nVRAM: back to 0
+        SBI_Load --> SBI_Infer : VRAM: +400MB
+        SBI_Infer --> SBI_Unload
+        SBI_Unload --> FREQ_Load : del model\nempty_cache()\nVRAM: back to 0
+        FREQ_Load --> FREQ_Infer : VRAM: +400MB
+        FREQ_Infer --> FREQ_Unload
+        FREQ_Unload --> [*] : del model\nempty_cache()\nVRAM: back to 0
+    }
+
+    GPU_PHASE --> CONFIDENCE_CHECK_2 : All GPU tools done\nVRAM: 0 GB
+
+    state CONFIDENCE_CHECK_2 <<choice>>
+    CONFIDENCE_CHECK_2 --> SYNTHESIS : Any confidence threshold
+    SYNTHESIS --> LLM_PHASE : Build structured text\nNo image data to LLM
+
+    state LLM_PHASE {
+        [*] --> OllamaCall
+        OllamaCall --> TokenStream : Phi-3 Mini generates\nOllama process: 1.8GB RAM
+        TokenStream --> JSONParse : Tokens stream to UI
+        JSONParse --> [*]
+        note right of OllamaCall : Separate OS process\nDoes NOT use PyTorch VRAM
+    }
+
+    LLM_PHASE --> VERDICT_STATE
+
+    state VERDICT_STATE {
+        [*] --> EvaluateScore
+        EvaluateScore --> REAL_V : score < 0.15
+        EvaluateScore --> FAKE_V : score > 0.85
+        EvaluateScore --> ESCALATE_V : 0.15 ≤ score ≤ 0.85
+    }
+
+    VERDICT_STATE --> REPORT_GEN : Generate JSON report\n+ heatmap descriptions
+
+    REPORT_GEN --> IDLE : Analysis complete\nAll VRAM freed\nOllama still running
+```
+
+### Static Architecture — What the System Is
 
 ```mermaid
 flowchart TD
-    subgraph INPUT["📥 INPUT"]
-        A[("Video / Image File")]
+    subgraph INPUT["📥 INPUT LAYER"]
+        VID["🎬 Video File\n.mp4 / .avi / .mov"]
+        IMG["🖼️ Image File\n.jpg / .png / .webp"]
     end
 
-    subgraph AGENT["🧠 AGENT CORE"]
-        B["Initialize State"]
-        C{"Confident?"}
-        D["LLM Reasoning"]
-        E["Select Tool"]
-        F["Execute Tool"]
-        G["Update State"]
+    subgraph PREPROCESS["⚙️ PREPROCESSING\nutils/preprocessing.py"]
+        FD["Face Detection\ndlib HOG detector"]
+        FC["Face Crop\n224×224 downscaled"]
+        NP["Native Patches\neye / hairline / jaw\n224×224 native res"]
+        LM["68-pt Landmarks\nnp.ndarray shape 68,2"]
+        FE["Frame Extraction\nN frames at 30fps"]
     end
 
-    subgraph TOOLS["🔧 TOOL REGISTRY"]
-        T1["check_c2pa()"]
-        T2["run_rppg()"]
-        T3["run_entropy()"]
-        T4["run_reflection()"]
-        T5["run_lipsync()"]
-        T6["run_dct()"]
+    subgraph CPU_TOOLS["⚡ CPU TOOLS — Zero VRAM"]
+        C2PA["🔏 check_c2pa()\nInput: file path\nOutput: valid bool, signer, timestamp\nTime: ~0.1s"]
+        RPPG["🫀 run_rppg()\nInput: N frames 30fps\nOutput: liveness bool, variance, SNR\nTime: ~2s"]
+        DCT["🔬 run_dct()\nInput: grayscale image\nOutput: grid_artifacts bool, score\nTime: ~0.3s"]
+        GEO["📐 run_geometry()\nInput: landmarks 68×2\nOutput: violations list, fake_score\nTime: ~0.2s"]
+        ILLUM["🌅 run_illumination()\nInput: face_crop, full_frame, landmarks\nOutput: direction_mismatch°, fake_score\nTime: ~0.5s"]
     end
 
-    subgraph MEMORY["💾 MEMORY"]
-        M1["Case History"]
-        M2["Pattern Database"]
-        M3["Failure Cases"]
+    subgraph GPU_TOOLS["🖥️ GPU TOOLS — Sequential Loading"]
+        CLIP["🧩 run_clip_adapter()\nInput: face tensor 224×224\nOutput: fake_score 0-1\nVRAM: 600MB | Time: ~1.5s"]
+        SBI["🔀 run_sbi()\nInput: face crop 224×224\nOutput: boundary_detected, score\nVRAM: 400MB | Time: ~0.8s"]
+        FREQ["〰️ run_freqnet()\nInput: image tensor 224×224\nOutput: freq_anomaly_score\nVRAM: 400MB | Time: ~0.5s"]
     end
 
-    subgraph OUTPUT["📊 OUTPUT"]
-        H[("XAI Forensic Report")]
+    subgraph ENSEMBLE["📊 ENSEMBLE SCORER\nutils/ensemble.py"]
+        WA["Weighted Aggregation\nCLIP×0.30 + SBI×0.20 +\nFreqNet×0.20 + rPPG×0.15 +\nDCT×0.10 + Geo×0.03 + Illum×0.02"]
+        ES["Ensemble Score\n0.0 — 1.0 fake probability"]
     end
 
-    A --> B --> C
-    C -->|"No"| D
-    D --> E
-    E --> F
-    F <--> TOOLS
-    F --> G --> C
-    C -->|"Yes"| H
-    
-    D <--> MEMORY
+    subgraph LLM["🧠 PHI-3 MINI — Ollama Process"]
+        FS["forensic_summary.py\nConvert all scores to\nstructured text prompt"]
+        PHI["Phi-3 Mini Q4_K_M\nStreaming tokens\nVRAM: 1.8GB via Ollama"]
+        OUT["Verdict + Reasoning\nJSON output"]
+    end
+
+    subgraph OUTPUT["📋 OUTPUT LAYER"]
+        REAL["✅ REAL\nConfidence > 0.85"]
+        FAKE["❌ FAKE\nConfidence > 0.85"]
+        ESC["⚠️ ESCALATE\nConfidence 0.50-0.85"]
+        RPT["📄 Report\nverdict, confidence,\nreasoning, key_evidence,\ntool_scores, heatmaps"]
+    end
+
+    VID --> FE --> FD
+    IMG --> FD
+    FD --> FC & NP & LM
+
+    FC --> C2PA
+    FE --> RPPG
+    FC --> DCT
+    LM --> GEO
+    FC & FD --> ILLUM
+
+    NP --> CLIP
+    FC --> SBI
+    NP --> FREQ
+
+    C2PA & RPPG & DCT & GEO & ILLUM --> WA
+    CLIP & SBI & FREQ --> WA
+    WA --> ES --> FS
+    FS --> PHI --> OUT
+
+    OUT --> REAL & FAKE & ESC
+    REAL & FAKE & ESC --> RPT
 
     style INPUT fill:#1a1a2e,stroke:#4cc9f0,color:#fff
-    style AGENT fill:#0f3460,stroke:#00ff88,color:#fff
-    style TOOLS fill:#16213e,stroke:#f39c12,color:#fff
-    style MEMORY fill:#16213e,stroke:#9b59b6,color:#fff
+    style PREPROCESS fill:#16213e,stroke:#4cc9f0,color:#fff
+    style CPU_TOOLS fill:#0d2137,stroke:#00ff88,color:#fff
+    style GPU_TOOLS fill:#0d2137,stroke:#f39c12,color:#fff
+    style ENSEMBLE fill:#0f3460,stroke:#9b59b6,color:#fff
+    style LLM fill:#0f3460,stroke:#e94560,color:#fff
     style OUTPUT fill:#1a1a2e,stroke:#4cc9f0,color:#fff
-```
-
-**Agent Behavior:**
-1. **Observe** — Receive media input and initialize analysis state
-2. **Think** — LLM reasons about current evidence and decides next action
-3. **Act** — Execute selected forensic tool
-4. **Update** — Incorporate tool results into state
-5. **Decide** — Check if confidence threshold reached; if not, loop back to Think
-
-### Tool Registry
-
-```mermaid
-flowchart LR
-    subgraph REGISTRY["🔧 FORENSIC TOOL REGISTRY"]
-        direction TB
-        
-        subgraph PROVENANCE["Provenance Tools"]
-            C2PA["check_c2pa()"]
-        end
-        
-        subgraph BIOLOGICAL["Biological Tools"]
-            RPPG["run_rppg()"]
-            REFLECT["run_reflection()"]
-        end
-        
-        subgraph NEURAL["Neural Tools"]
-            ENTROPY["run_entropy()"]
-            DCT["run_dct()"]
-            ARTIFACTS["run_artifacts()"]
-        end
-        
-        subgraph TEMPORAL["Temporal Tools"]
-            LIPSYNC["run_lipsync()"]
-            BLINK["run_blink_analysis()"]
-        end
-        
-        subgraph META["Meta Tools"]
-            REPORT["generate_report()"]
-            ESCALATE["escalate_to_human()"]
-        end
-    end
-
-    AGENT["🧠 LLM Agent"] --> REGISTRY
-
-    style REGISTRY fill:#1a1a2e,stroke:#4cc9f0,color:#fff
-    style PROVENANCE fill:#00ff88,stroke:#000,color:#000
-    style BIOLOGICAL fill:#e94560,stroke:#fff,color:#fff
-    style NEURAL fill:#f39c12,stroke:#000,color:#000
-    style TEMPORAL fill:#9b59b6,stroke:#fff,color:#fff
-    style META fill:#4cc9f0,stroke:#000,color:#000
 ```
 
 ---
@@ -512,20 +569,20 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 │                                                                     │
 │  Step 3 │ PLAN      │ "No provenance — run biological check"       │
 │         │ ACT       │ run_rppg() → Flatline detected               │
-│         │ UPDATE    │ → BPM: 0, rPPG confidence: 0.1              │
+│         │ UPDATE    │ → Liveness: NOT DETECTED, signal_variance: 0.003, confidence: 0.1 │
 │         │           │ → Agent confidence: 0.35 (leaning FAKE)      │
 │                                                                     │
 │  Step 4 │ REASON    │ "Low biological signal. This face has no     │
 │         │           │  detectable pulse. Could be a still image    │
-│         │           │  or a generated face. Running entropy."      │
-│         │ ACT       │ run_entropy() → High anomaly in hairline     │
+│         │           │  or a generated face. Running CLIP."         │
+│         │ ACT       │ run_clip_adapter() → High anomaly in hairline│
 │         │ UPDATE    │ → Anomaly score: 0.87, hotspot: hair region  │
 │         │           │ → Agent confidence: 0.82 (likely FAKE)       │
 │                                                                     │
-│  Step 5 │ REASON    │ "Entropy anomaly in hairline is consistent   │
+│  Step 5 │ REASON    │ "CLIP anomaly in hairline is consistent      │
 │         │           │  with diffusion model artifacts. One more    │
 │         │           │  check for high confidence."                 │
-│         │ ACT       │ run_artifacts() → GAN fingerprint detected   │
+│         │ ACT       │ run_freqnet() → GAN fingerprint detected     │
 │         │ UPDATE    │ → Artifact score: 0.91                       │
 │         │           │ → Agent confidence: 0.92 → EARLY STOP        │
 │                                                                     │
@@ -534,12 +591,12 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 │         │           │ │ Verdict:    FAKE                        │  │
 │         │           │ │ Confidence: 0.92                        │  │
 │         │           │ │ Reasoning:  "No biological pulse was    │  │
-│         │           │ │  detected (rPPG flatline). Entropy      │  │
+│         │           │ │  detected (rPPG flatline). CLIP         │  │
 │         │           │ │  analysis found diffusion artifacts in  │  │
-│         │           │ │  the hairline region. Spatial artifact  │  │
+│         │           │ │  the hairline region. FreqNet        │  │
 │         │           │ │  detection confirmed GAN fingerprints." │  │
 │         │           │ │ Tools used: [check_c2pa, run_rppg,     │  │
-│         │           │ │  run_entropy, run_artifacts]            │  │
+│         │           │ │  run_clip_adapter, run_freqnet]         │  │
 │         │           │ │ Tools skipped: [run_lipsync,            │  │
 │         │           │ │  run_reflection, run_dct]               │  │
 │         │           │ └─────────────────────────────────────────┘  │
@@ -562,7 +619,7 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 | **Agent Brain** | Phi-3 Mini Instruct | Q4_K_M | 2.2 GB | 1.8 GB | CPU/GPU | [Microsoft](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf) |
 | **Universal Forgery** | CLIP ViT-B/32 + Forensic Adapter | patch32 | 352 MB | 600 MB | GPU | [OpenAI CLIP](https://github.com/openai/CLIP) + adapter |
 | **Blend Boundary** | SBI Detector | EfficientNet-B4 backbone | 90 MB | 400 MB | GPU | [CVPR 2022](https://github.com/mapooon/SelfBlendedImages) |
-| **Frequency Neural** | FreqNet / F3Net | ResNet-50 backbone | 45 MB | 400 MB | GPU | [ECCV 2020](https://github.com/neverUseThisName/F3Net) |
+| **Frequency Neural** | FreqNet / F3Net | ResNet-50 backbone | 45 MB | 400 MB | GPU | [ECCV 2020](https://github.com/yyk-wew/F3Net) |
 | **Face Landmarks** | dlib | 19.24 (68-pt) | 100 MB | 0 | CPU | [dlib.net](http://dlib.net/files/) |
 | **Liveness (rPPG)** | POS Algorithm | custom | 0 MB | 0 | CPU | scipy/numpy |
 | **Frequency (DCT)** | DCT Analysis | custom | 0 MB | 0 | CPU | scipy |
@@ -881,7 +938,7 @@ pie showData
 
 ### The Controller Brain (LLM Agent)
 
-The MiniCPM-V 2.6 model serves as the central reasoning engine with three responsibilities:
+The Phi-3 Mini model serves as the central reasoning engine with three responsibilities:
 
 ```mermaid
 flowchart TB
@@ -910,9 +967,9 @@ flowchart TB
 | **Reasoner** | Interprets tool outputs | "High entropy in hairline suggests diffusion artifacts" |
 | **Synthesizer** | Generates final explanation | Writes verdict grounded in accumulated evidence |
 
-**Forensic Synthesis Prompt (MiniCPM-V):**
+**Forensic Synthesis Prompt (Phi-3 Mini):**
 
-The synthesizer uses a structured prompt to generate the final verdict:
+The synthesizer uses a structured prompt with Phi-3 Mini to generate the final verdict:
 
 ```python
 SYNTHESIS_PROMPT = """
@@ -1055,7 +1112,7 @@ def check_pulse(frames, fs=30):
         "liveness_detected": verdict == "PULSE_PRESENT",
         "verdict": verdict,           # PULSE_PRESENT / NO_PULSE / AMBIGUOUS
         "confidence": round(score, 2),
-        "signal_variance": round(float(np.var(H)), 6),
+        "signal_variance": round(float(np.var(bvp)), 6),
         "snr_db": round(snr, 2),
         "frames_analyzed": len(frames),
         "interpretation": (
@@ -1068,37 +1125,7 @@ def check_pulse(frames, fs=30):
     }
 ```
 
-#### `run_entropy()` — AIMv2 Entropy Analysis
 
-Uses Apple's autoregressive image model to detect generative artifacts through prediction entropy:
-
-```python
-def compute_patch_entropy(face_crop, model, processor):
-    """
-    Compute per-patch prediction entropy using AIMv2.
-    Real faces have uniform entropy; generated faces show
-    anomalous high-entropy patches (especially at boundaries).
-    """
-    inputs = processor(images=face_crop, return_tensors="pt").to(device)
-    
-    with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True)
-    
-    # Extract patch-level features from last hidden state
-    patch_features = outputs.last_hidden_state[:, 1:, :]  # Skip CLS token
-    
-    # Compute per-patch entropy: -sum(p * log(p))
-    probs = torch.softmax(patch_features, dim=-1)
-    entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
-    
-    # Reshape to spatial grid (16x16 patches for 224x224 input)
-    grid_size = int(entropy.shape[1] ** 0.5)
-    entropy_map = entropy.view(grid_size, grid_size).cpu().numpy()
-    
-    anomaly_score = (entropy_map > entropy_map.mean() + 2 * entropy_map.std()).mean()
-    
-    return {"anomaly_score": float(anomaly_score), "heatmap": entropy_map}
-```
 
 ---
 
@@ -1360,77 +1387,81 @@ flowchart LR
 
 ## 🔀 Agent Decision Flows
 
-### Dynamic Analysis Paths
+### Dynamic Flow (Agent Decision Logic)
 
 ```mermaid
 flowchart TD
-    START(["🎬 Media Input"]) --> C2PA{"check_c2pa()"}
+    START(["📂 Media Uploaded\napp.py receives file"])
     
-    C2PA -->|"✅ Valid Signature"| STOP_VERIFIED["✅ VERIFIED AT SOURCE<br/>(Skip all analysis)"]
-    C2PA -->|"❌ No Signature"| RPPG{"run_rppg()"}
+    START --> INIT["Initialize Agent State\nconfidence=0.50\ntools_run=[]"]
     
-    RPPG -->|"✅ BPM: 60-100<br/>Confidence > 0.8"| CHECK_ENOUGH1{"Confidence<br/>Sufficient?"}
-    RPPG -->|"⚠️ Inconclusive<br/>Confidence 0.4-0.8"| ENTROPY{"run_entropy()"}
-    RPPG -->|"❌ Flatline<br/>Confidence < 0.4"| ENTROPY
+    INIT --> C2PA_RUN["Run check_c2pa()\n⚡ CPU | ~0.1s\n🖥️ UI card appears instantly"]
     
-    CHECK_ENOUGH1 -->|"Yes"| VERDICT_REAL["✅ LIKELY REAL"]
-    CHECK_ENOUGH1 -->|"Need More"| REFLECT{"run_reflection()"}
-    
-    ENTROPY -->|"❌ High Anomaly"| ARTIFACTS{"run_artifacts()"}
-    ENTROPY -->|"✅ Normal"| CHECK_ENOUGH2{"Confidence<br/>Sufficient?"}
-    
-    CHECK_ENOUGH2 -->|"Yes"| VERDICT_REAL
-    CHECK_ENOUGH2 -->|"Need More"| LIPSYNC{"run_lipsync()"}
-    
-    ARTIFACTS --> FINAL_SYNTH["🧠 Agent Synthesis"]
-    REFLECT --> FINAL_SYNTH
-    LIPSYNC --> FINAL_SYNTH
-    
-    FINAL_SYNTH --> VERDICT{"Final Verdict"}
-    
-    VERDICT -->|"Confidence > 0.9"| FAKE["❌ FAKE"]
-    VERDICT -->|"Confidence < 0.5"| REAL["✅ REAL"]
-    VERDICT -->|"0.5 - 0.9"| ESCALATE["⚠️ ESCALATE TO HUMAN"]
+    C2PA_RUN --> C2PA_Q{"C2PA\nValid?"}
+    C2PA_Q -->|"✅ Signed"| VERIFIED["🎉 VERIFIED AT SOURCE\nSkip all tools\nconfidence=1.0"]
+    C2PA_Q -->|"❌ Unsigned\n~99% of files"| RPPG_Q{"Is it\na video?"}
+
+    RPPG_Q -->|"Yes"| RPPG_RUN["Run run_rppg()\n⚡ CPU | ~2s\n🖥️ Liveness card appears"]
+    RPPG_Q -->|"No image"| SKIP_RPPG["Skip rPPG\nNot applicable\nfor static images"]
+
+    RPPG_RUN --> RPPG_OUT{"Liveness\nResult?"}
+    RPPG_OUT -->|"NO_PULSE\nvariance < 0.005"| CONF_DOWN["confidence -= 0.2\nStrong fake signal"]
+    RPPG_OUT -->|"AMBIGUOUS\nvariance 0.005-0.020"| CONF_NEUTRAL["confidence unchanged\nWeak signal"]
+    RPPG_OUT -->|"PULSE_PRESENT\nvariance > 0.020"| CONF_UP["confidence += 0.15\nReal signal"]
+
+    CONF_DOWN & CONF_NEUTRAL & CONF_UP & SKIP_RPPG --> DCT_RUN
+
+    DCT_RUN["Run run_dct()\n⚡ CPU | ~0.3s\n🖥️ Frequency plot appears"]
+    GEO_RUN["Run run_geometry()\n⚡ CPU | ~0.2s\n🖥️ Geometry card appears"]
+    ILLUM_RUN["Run run_illumination()\n⚡ CPU | ~0.5s\n🖥️ Illumination card appears"]
+
+    DCT_RUN --> GEO_RUN --> ILLUM_RUN
+
+    ILLUM_RUN --> EARLY_Q1{"Confidence\n> 0.85?"}
+    EARLY_Q1 -->|"Yes — clear signal"| SYNTH
+    EARLY_Q1 -->|"No — need more"| CLIP_RUN
+
+    CLIP_RUN["Load CLIP + Adapter\n🖥️ GPU | 600MB VRAM\n~1.5s inference\n🖥️ CLIP card appears\ndel model + empty_cache()"]
+
+    CLIP_RUN --> EARLY_Q2{"Confidence\n> 0.85?"}
+    EARLY_Q2 -->|"Yes"| SYNTH
+    EARLY_Q2 -->|"No"| SBI_Q{"Is it a\nface-swap\ncandidate?"}
+
+    SBI_Q -->|"CLIP score\n0.4-0.7\nmay be swap"| SBI_RUN
+    SBI_Q -->|"CLIP score > 0.7\nfully synthetic"| FREQ_RUN
+
+    SBI_RUN["Load SBI Detector\n🖥️ GPU | 400MB VRAM\n~0.8s inference\n🖥️ Blend boundary card appears\ndel model + empty_cache()"]
+
+    SBI_RUN --> FREQ_RUN
+
+    FREQ_RUN["Load FreqNet\n🖥️ GPU | 400MB VRAM\n~0.5s inference\n🖥️ Frequency neural card appears\ndel model + empty_cache()"]
+
+    FREQ_RUN --> ENSEMBLE["Weighted Ensemble Score\nAll tool scores aggregated\n🖥️ Score bars update live"]
+
+    ENSEMBLE --> SYNTH
+
+    SYNTH["Build Forensic Summary Text\nAll scores → structured prompt\nNo images sent to LLM"]
+
+    SYNTH --> LLM_STREAM["Phi-3 Mini via Ollama\n1.8GB — separate process\nTokens stream to UI\n~4-6 seconds\n🖥️ Text appears token by token"]
+
+    LLM_STREAM --> VERDICT{"Final\nVerdict"}
+
+    VERDICT -->|"score > 0.85"| FAKE_OUT["❌ FAKE\n🖥️ Red verdict banner"]
+    VERDICT -->|"score < 0.15"| REAL_OUT["✅ REAL\n🖥️ Green verdict banner"]
+    VERDICT -->|"0.15 - 0.85"| ESC_OUT["⚠️ INCONCLUSIVE\nEscalate to human\n🖥️ Yellow banner"]
+
+    VERIFIED --> REAL_OUT
 
     style START fill:#4cc9f0,stroke:#000,color:#000
-    style STOP_VERIFIED fill:#00ff88,stroke:#000,color:#000
-    style VERDICT_REAL fill:#00ff88,stroke:#000,color:#000
-    style REAL fill:#00ff88,stroke:#000,color:#000
-    style FAKE fill:#e94560,stroke:#fff,color:#fff
-    style ESCALATE fill:#f39c12,stroke:#000,color:#000
-    style FINAL_SYNTH fill:#9b59b6,stroke:#fff,color:#fff
+    style VERIFIED fill:#00ff88,stroke:#000,color:#000
+    style CONF_DOWN fill:#e94560,stroke:#fff,color:#fff
+    style CONF_UP fill:#00ff88,stroke:#000,color:#000
+    style FAKE_OUT fill:#e94560,stroke:#fff,color:#fff
+    style REAL_OUT fill:#00ff88,stroke:#000,color:#000
+    style ESC_OUT fill:#f39c12,stroke:#000,color:#000
+    style LLM_STREAM fill:#9b59b6,stroke:#fff,color:#fff
+    style ENSEMBLE fill:#0f3460,stroke:#9b59b6,color:#fff
 ```
-
-### Conditional Autonomy
-
-The agent adapts when standard paths fail:
-
-```mermaid
-flowchart TD
-    subgraph FALLBACK["🔄 CONDITIONAL AUTONOMY"]
-        F1{"Face Detected?"}
-        F1 -->|"No"| AUDIO["Switch to Audio Forensics<br/>run_audio_artifacts()"]
-        F1 -->|"Yes"| RPPG2["run_rppg()"]
-        
-        RPPG2 -->|"Failed"| GLINT["Fallback: run_reflection()"]
-        GLINT -->|"Failed"| BLINK["Fallback: run_blink_analysis()"]
-        BLINK -->|"Failed"| ESCALATE2["escalate_to_human()<br/>'Insufficient biological signals'"]
-        
-        RPPG2 -->|"Success"| CONTINUE["Continue Analysis"]
-        GLINT -->|"Success"| CONTINUE
-        BLINK -->|"Success"| CONTINUE
-    end
-
-    style FALLBACK fill:#1a1a2e,stroke:#f39c12,color:#fff
-    style ESCALATE2 fill:#e94560,stroke:#fff,color:#fff
-    style CONTINUE fill:#00ff88,stroke:#000,color:#000
-```
-
-**Key Autonomy Rules:**
-- **Face not detected** → Switch to audio-only forensics
-- **rPPG fails** → Try corneal reflection analysis
-- **Both biological checks fail** → Rely on neural analysis + escalate
-- **All checks inconclusive** → Mandatory human review
 
 ### Goal & Reward Heuristics
 
@@ -1513,11 +1544,11 @@ Aegis-X uses the **chrominance-based (CHROM)** rPPG method, which projects the R
 4.  **Peak detection** — Find periodic peaks in the filtered signal to estimate BPM
 
 **Interpretation:**
-| rPPG Result | BPM | Confidence | Agent Interpretation |
-|:------------|:----|:-----------|:---------------------|
-| Strong pulse | 55–100 | > 0.8 | Biological signal present — likely real face |
-| Weak pulse | Variable | 0.4–0.8 | Inconclusive — may be poor video quality |
-| Flatline | 0 | < 0.4 | No biological signal — high suspicion of fake |
+| rPPG Result | Signal Variance | Confidence | Agent Interpretation |
+|:------------|:------------------|:-----------|:---------------------|
+| Strong pulse | > 0.020 | > 0.8 | Biological signal present — likely real face |
+| Weak pulse | 0.008–0.020 | 0.4–0.8 | Inconclusive — may be poor video quality |
+| Flatline | < 0.005 | < 0.4 | No biological signal — high suspicion of fake |
 
 **Real-World Output Examples:**
 
@@ -1586,7 +1617,7 @@ Aegis-X processes all media **entirely on the user's local machine**. No frames,
 4. **Air-Gapped Environments** — Military, intelligence, and corporate investigations often operate in air-gapped networks where cloud access is impossible.
 
 **Aegis-X's Offline Architecture:**
-- All 7 forensic models run locally (total ~6 GB)
+- All forensic tools run locally (models total ~2.8 GB, Phi-3 Mini via Ollama ~2.2 GB separately)
 - No network calls during analysis (verified by design)
 - Memory/experience database stored as local JSON files
 - Reports generated and saved locally
@@ -1608,7 +1639,7 @@ result = agent.analyze("path/to/video.mp4")
 print(result.verdict)      # "FAKE" or "REAL"
 print(result.confidence)   # 0.92
 print(result.reasoning)    # Natural language explanation
-print(result.tools_used)   # ["check_c2pa", "run_rppg", "run_entropy"]
+print(result.tools_used)   # ["check_c2pa", "run_rppg", "run_geometry", "run_clip_adapter"]
 ```
 
 ### Advanced Usage
@@ -1622,7 +1653,7 @@ config = AnalysisConfig(
     max_iterations=5,
     enable_memory=True,
     device="cuda",
-    skip_tools=["run_lipsync"],  # Skip specific tools
+    skip_tools=["run_sbi"],  # Skip specific tools
 )
 
 agent = Agent(config=config)
@@ -1684,7 +1715,7 @@ with open("batch_report.json", "w") as f:
 | `--confidence-threshold` | Minimum confidence to stop analysis | 0.9 |
 | `--max-iterations` | Maximum agent reasoning loops | 10 |
 | `--skip-c2pa` | Skip C2PA provenance check | False |
-| `--skip-audio` | Skip lip-sync analysis | False |
+| `--skip-sbi` | Skip SBI analysis | False |
 | `--cpu-only` | Force CPU-only inference | False |
 | `--device` | Specify device (cuda, mps, cpu) | auto |
 
@@ -2073,13 +2104,13 @@ Download the dlib model using the commands in the Model Downloads section, then 
 
 **Note:** This is expected for most files. C2PA signatures are only present in media from supported cameras (Leica, Sony, Nikon with CAI support) or editing software (Adobe Photoshop, Lightroom).
 
-#### "Whisper model download failed"
-**Cause:** Network issues or insufficient disk space.
+#### "Ollama connection refused"
+**Cause:** Ollama service is not running or port is blocked.
 
 **Solutions:**
-1. Check internet connection
-2. Ensure 500MB+ free disk space
-3. Manually download from Hugging Face using the commands in Model Downloads section
+1. Ensure Ollama is installed and running (`ollama serve`)
+2. Verify Phi-3 Mini is pulled (`ollama pull phi3:mini`)
+3. Check `AEGIS_OLLAMA_URL` environment variable if not on localhost
 
 #### Slow performance on CPU
 **Cause:** CPU inference is 10-20x slower than GPU.
@@ -2087,7 +2118,7 @@ Download the dlib model using the commands in the Model Downloads section, then 
 **Solutions:**
 1. Use a CUDA-compatible GPU if available
 2. Process at lower resolution
-3. Disable optional tools (--skip-audio)
+3. Disable optional tools (--skip-sbi)
 4. Reduce max_iterations in config
 
 ### Getting Help
@@ -2191,6 +2222,8 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - **C2PA** for content provenance standards
 - **Ollama** for local LLM inference runtime
 - **FaceForensics++, Celeb-DF, WildDeepfake, DFDC** teams for benchmark datasets
+
+
 
 ---
 
