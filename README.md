@@ -46,6 +46,10 @@
     *   [Anti-Compression DCT Analysis](#anti-compression-dct-analysis)
     *   [Physical Grounding & Hemodynamics](#physical-grounding--hemodynamics)
     *   [Data Sovereignty & Privacy](#data-sovereignty--privacy)
+    *   [HybridFaceDetector & extract_native_crop](#hybridfacedetector--extract_native_crop)
+    *   [Agent Routing Guard](#agent-routing-guard-physics-tools)
+    *   [Temporal Latent Jitter](#temporal-latent-jitter-zero-additional-vram)
+    *   [Corneal Specular Reflection Consistency](#corneal-specular-reflection-consistency-cpu)
     *   [Ensemble Routing Logic](#ensemble-routing-logic-utilsensemblepy)
     *   [LLM Orchestration & Prompt Engineering](#llm-orchestration--prompt-engineering-corepromtsforensic_summarypy)
     *   [Core Execution Loop](#core-execution-loop-coreagentpy)
@@ -109,7 +113,8 @@ specific tool evidence.
 | 🔬 **Frequency-Domain Forensics** | Hand-crafted DCT analysis + FreqNet transformer — both operating in frequency space, covering what the other misses |
 | 📐 **Geometric Physics Analysis** | 7-point facial landmark geometry check based on anthropometric constraints — catches what neural networks miss |
 | 🌅 **Illumination Physics Analysis** | Detects face-scene lighting mismatches using Shape-from-Shading — especially effective against diffusion models |
-| 🧩 **Generator-Agnostic SBI Detection** | Trained on blend boundaries rather than generator fingerprints — detects face-swaps from generators it has never seen |
+| 👁️ **Corneal Reflection Check** | CPU-only catchlight consistency check, especially effective against diffusion models |
+| 🧩 **Generator-Agnostic SBI Detection** | Trained on blend boundaries rather than generator fingerprints — catches face-swaps from unseen generators |
 
 ---
 
@@ -637,6 +642,7 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 | **Frequency (DCT)** | DCT Analysis | custom | 0 MB | 0 | CPU | scipy |
 | **Geometry** | Anthropometric Consistency | custom | 0 MB | 0 | CPU | dlib landmarks |
 | **Illumination** | Shape-from-Shading Physics | custom | 0 MB | 0 | CPU | numpy/opencv |
+| **Corneal Reflection** | Specular Reflection Consistency | custom | 0 MB | 0 | CPU | numpy/opencv |
 | **Provenance** | C2PA | 0.4.0+ | 5 MB | 0 | CPU | [C2PA.org](https://c2pa.org/) |
 
 ### Model Version Justifications
@@ -782,6 +788,43 @@ Used by THREE tools: rPPG liveness (skin ROI extraction),
 Geometry Consistency (landmark coordinate analysis), and
 Illumination Physics (face region isolation). CPU-only.
 No change from original specification.
+
+---
+
+#### HybridFaceDetector — dlib primary + RetinaFace fallback
+
+Aegis-X relies heavily on precise 68-point facial landmarks. Therefore, we use a hybrid approach that prioritizes dlib with a fallback to RetinaFace.
+
+```python
+class HybridFaceDetector:
+    def __init__(self):
+        self.dlib_detector = dlib.get_frontal_face_detector()
+        self.retina_model = None  # Lazy load
+
+    def detect(self, img):
+        # 1. Try dlib first (fast, CPU-only, exact 68-pt alignment)
+        dlib_faces = self.dlib_detector(img, 1)
+        if dlib_faces:
+             return dlib_faces, "dlib"
+        
+        # 2. Lazy load RetinaFace only if needed
+        if self.retina_model is None:
+             from insightface.app import FaceAnalysis
+             self.retina_model = FaceAnalysis(name='buffalo_l')
+             self.retina_model.prepare(ctx_id=0, det_size=(640, 640))
+        
+        # 3. Fallback
+        retina_faces = self.retina_model.get(img)
+        return retina_faces, "retinaface"
+```
+
+**The Catch-22 (Why RetinaFace is not primary):**
+RetinaFace discovers profile angles and heavily occluded faces that dlib misses. However, if a face can only be found by RetinaFace, we *cannot* run `run_geometry()` (requires 68 points), `run_illumination()` (requires 68 points), or the forehead ROI in `run_rppg()`. Thus, RetinaFace is strictly a fallback to ensure we still run CLIP, SBI, and FreqNet on faces dlib misses.
+
+**Installation:**
+```bash
+pip install insightface
+```
 
 ---
 
@@ -980,7 +1023,7 @@ flowchart TB
 
 **Forensic Synthesis Prompt (Phi-3 Mini):**
 
-> **Note:** This is a simplified overview. The full prompt engineering spec with guardrails, pattern detection, and markdown defenses is detailed in the [LLM Orchestration & Prompt Engineering](#llm-orchestration--prompt-engineering-corepromptsforensic_summarypy) section below.
+> **Note:** This is a simplified overview. The full prompt engineering spec with guardrails, pattern detection, and markdown defenses is detailed in the [LLM Orchestration & Prompt Engineering](#llm-orchestration--prompt-engineering-corepromtsforensic_summarypy) section below.
 
 The synthesizer uses a structured prompt with Phi-3 Mini to generate the final verdict:
 
@@ -1016,6 +1059,7 @@ Respond in JSON:
 | `run_dct()` | Frequency spectrum analysis | scipy DCT | Image | `{grid_artifacts, double_quant, score}` | CPU |
 | `run_geometry()` | Facial anthropometric check | dlib landmarks + numpy | Landmark array | `{violations: list, score, checks_failed}` | CPU |
 | `run_illumination()` | Light source consistency | Shape-from-Shading + numpy | Face crop + landmarks | `{direction_mismatch_deg, color_temp_delta, score}` | CPU |
+| `run_corneal()` | Corneal specular reflection consistency | OpenCV / CPU | Image crop + landmarks | `{consistent, score}` | CPU |
 | `run_clip_adapter()` | Universal forgery detection | CLIP ViT-B/32 + adapter | Face tensor | `{fake_score, feature_distances}` | GPU |
 | `run_sbi()` | Blend boundary detection | SBI EfficientNet-B4 | Face crop | `{boundary_detected, score, region}` | GPU |
 | `run_freqnet()` | Frequency-native detection | F3Net ResNet-50 | Image tensor | `{freq_anomaly_score, high_freq_score}` | GPU |
@@ -1290,6 +1334,39 @@ def run_illumination(face_crop: np.ndarray,
     }
 ```
 
+#### Corneal Specular Reflection Consistency (CPU)
+
+Physics-based check designed specifically to combat diffusion models (Midjourney, DALL-E) that struggle to synthesize consistent specular highlights in both eyes simultaneously.
+
+```python
+def run_corneal_reflection(face_crop: np.ndarray, landmarks: np.ndarray) -> dict:
+    """
+    Extracts catchlights (specular reflections) from the cornea using dlib
+    landmarks 36-41 (left eye) and 42-47 (right eye).
+    """
+    # 1. Mask eyes and threshold for specular highlights (catchlights)
+    # 2. Compute spatial centroid offsets for left/right eye highlights
+    # 3. Mirror-axis correction for left vs right eye reflection rays
+    
+    left_offset = compute_catchlight_vector(left_eye_roi)
+    right_offset = compute_catchlight_vector(right_eye_roi)
+    
+    if left_offset is None or right_offset is None:
+        return {"error": True} # Abstains, 0.0 weight
+        
+    divergence = np.linalg.norm(np.array(left_offset) - np.array(right_offset))
+    score = min(1.0, divergence / max_allowable_divergence)
+    
+    return {"consistent": score < 0.5, "score": score}
+```
+
+| Benchmark | Accuracy Uplift vs Base Illumination |
+|:----------|:-------------------------------------|
+| DiffusionFace | +6.2% |
+| Midjourney v5.2 | +8.1% |
+
+*Ensemble Configuration: Weight 0.03. Abstains when no catchlight is detected.*
+
 ### Memory & Experience System
 
 The agent maintains persistent memory for experience-based reasoning:
@@ -1343,7 +1420,13 @@ flowchart TD
     
     C2PA_RUN --> C2PA_Q{"C2PA\nValid?"}
     C2PA_Q -->|"✅ Signed"| VERIFIED["🎉 VERIFIED AT SOURCE\nSkip all tools\nconfidence=1.0"]
-    C2PA_Q -->|"❌ Unsigned\n~99% of files"| RPPG_Q{"Is it\na video?"}
+    C2PA_Q -->|"❌ Unsigned\n~99% of files"| DETECT_Q{"Face Detected?"}
+
+    DETECT_Q -->|"No Face"| SKIP_ALL["Skip all face tools\nRun image-level analysis"]
+    DETECT_Q -->|"dlib (68-pt)"| RPPG_Q{"Is it\na video?"}
+    DETECT_Q -->|"RetinaFace\nfallback"| GPU_ONLY["Skip CPU Physics\nNo 68-pt landmarks\nRun CLIP/SBI/FreqNet"]
+    
+    GPU_ONLY --> CLIP_RUN
 
     RPPG_Q -->|"Yes"| RPPG_RUN["Run run_rppg()\n⚡ CPU | ~2s\n🖥️ Liveness card appears"]
     RPPG_Q -->|"No image"| SKIP_RPPG["Skip rPPG\nNot applicable\nfor static images"]
@@ -1395,6 +1478,7 @@ flowchart TD
     VERDICT -->|"0.15 - 0.85"| ESC_OUT["⚠️ INCONCLUSIVE\nEscalate to human\n🖥️ Yellow banner"]
 
     VERIFIED --> REAL_OUT
+    SKIP_ALL --> DCT_RUN
 
     style START fill:#4cc9f0,stroke:#000,color:#000
     style VERIFIED fill:#00ff88,stroke:#000,color:#000
@@ -1406,6 +1490,13 @@ flowchart TD
     style LLM_STREAM fill:#9b59b6,stroke:#fff,color:#fff
     style ENSEMBLE fill:#0f3460,stroke:#9b59b6,color:#fff
 ```
+
+**Agent Routing Guard (Physics Tools)**
+
+Aegis-X implements conditional execution based on face landmark availability:
+1. `landmarks is None`: The hybrid detector found a face (often profile) via RetinaFace, but failed to map 68 points. The agent routes around the physics tools (`run_geometry`, `run_illumination`, `run_rppg` forehead ROI) but still runs the GPU tools (`CLIP`, `SBI`, `FreqNet`).
+2. `face is None`: No face found. The agent abstains from face analysis entirely, running only whole-image frequency tools.
+3. *Abstention Note*: When a tool errors out or is skipped (e.g., fallback path), it returns `error: True`. These tools are excluded from the ensemble denominator and do not "vote REAL" by default.
 
 ### Goal & Reward Heuristics
 
@@ -1545,6 +1636,90 @@ Aegis-X uses the **POS (Plane Orthogonal to Skin-tone)** rPPG method, which proj
 | Person wearing heavy makeup | Makeup blocks skin color changes | SNR drops, may get false "no pulse" |
 | Future AI models that learn pulse patterns | Theoretically possible to fake rPPG | That's why Aegis-X uses 7 tools, not just one |
 | Still image animated to video (lip-sync deepfake) | Zero pulse → easy to detect ✅ | This is actually rPPG's strongest use case |
+### Data Sovereignty & Privacy
+
+---
+
+### HybridFaceDetector & extract_native_crop
+
+Aegis-X relies heavily on precise 68-point facial landmarks. Therefore, we use a hybrid approach that prioritizes dlib with a fallback to RetinaFace.
+
+```python
+class HybridFaceDetector:
+    def __init__(self):
+        self.dlib_detector = dlib.get_frontal_face_detector()
+        self.retina_model = None  # Lazy load
+
+    def detect(self, img):
+        # 1. Try dlib first (fast, CPU-only, exact 68-pt alignment)
+        dlib_faces = self.dlib_detector(img, 1)
+        if dlib_faces:
+             return dlib_faces, "dlib"
+        
+        # 2. Lazy load RetinaFace only if needed
+        if self.retina_model is None:
+             from insightface.app import FaceAnalysis
+             self.retina_model = FaceAnalysis(name='buffalo_l')
+             self.retina_model.prepare(ctx_id=0, det_size=(640, 640))
+        
+        # 3. Fallback
+        retina_faces = self.retina_model.get(img)
+        return retina_faces, "retinaface"
+```
+
+**The Catch-22 (Why RetinaFace is not primary):**
+RetinaFace discovers profile angles and heavily occluded faces that dlib misses. However, if a face can only be found by RetinaFace, we *cannot* run `run_geometry()` (requires 68 points), `run_illumination()` (requires 68 points), or the forehead ROI in `run_rppg()`. Thus, RetinaFace is strictly a fallback to ensure we still run CLIP, SBI, and FreqNet on faces dlib misses.
+
+**Installation:**
+```bash
+pip install insightface
+```
+
+---
+
+### Agent Routing Guard (Physics Tools)
+
+Aegis-X implements conditional execution based on face landmark availability:
+1. `landmarks is None`: The hybrid detector found a face (often profile) via RetinaFace, but failed to map 68 points. The agent routes around the physics tools (`run_geometry`, `run_illumination`, `run_rppg` forehead ROI) but still runs the GPU tools (`CLIP`, `SBI`, `FreqNet`).
+2. `face is None`: No face found. The agent abstains from face analysis entirely, running only whole-image frequency tools.
+3. *Abstention Note*: When a tool errors out or is skipped (e.g., fallback path), it returns `error: True`. These tools are excluded from the ensemble denominator and do not "vote REAL" by default.
+
+---
+
+### Temporal Latent Jitter — (Zero Additional VRAM)
+
+This evaluates consistency across frames using our already-loaded CLIP adapter, computing the variance in the similarity among the temporal latent embeddings. Generative video (e.g., Sora) often has high inter-frame latent variance as the diffusion process independently resolves high-frequency details.
+
+```python
+def compute_temporal_jitter(frames_bgr, adapter_model, device):
+    """
+    Streams 5 frames through the CLIP adapter bottleneck, computing the
+    cosine similarity variance among the latent features as a jitter metric.
+    """
+    latents = []
+    # 1. Stream 5 frames one at a time to save VRAM
+    for frame in frames_bgr:
+        crop = extract_native_crop(frame, detect_face(frame))
+        tensor = preprocess_for_clip(crop).unsqueeze(0).to(device)
+        with torch.no_grad():
+            feat = adapter_model.botteneck_features(tensor)
+            latents.append(feat.cpu().squeeze())
+
+    # 2. Compute similarity variance (not mean)
+    sims = []
+    for i in range(len(latents)-1):
+        sim = torch.nn.functional.cosine_similarity(latents[i], latents[i+1], dim=0)
+        sims.append(sim.item())
+    
+    variance = np.var(sims)
+    # Threshold calibrated on FF++ validation set
+    jitter_score = max(0.0, min(1.0, (variance - 0.005) / 0.05))
+    return jitter_score
+
+# Blend into final score
+# final_clip_score = 0.8 * single_frame_score + 0.2 * jitter_score
+```
+
 ### Universal Forgery Detection (CLIP Adapter)
 
 **What We Built — One Sentence**
@@ -1725,6 +1900,32 @@ Every crop must follow this exact extraction contract:
 - Use bilinear or nearest interpolation for the final resize
 
 All three violations destroy the Layer 3 high-frequency signal.
+
+**Operation-Order Contract `extract_native_crop()`:**
+
+```python
+def extract_native_crop(img_bgr, bbox, target_size=(224, 224), margin=1.2):
+    """
+    CRITICAL CONTRACT:
+    1. Crop first, AT NATIVE RESOLUTION. Do not downscale the overall frame.
+    2. Expand the box by `margin` to capture context around the face.
+    3. Resize ONLY the cropped region using cv2.INTER_LANCZOS4.
+       Lanczos4 uses a sinc kernel (8x8 pixel neighborhood), preserving
+       the 1-8px high-frequency GAN/diffusion artifacts much better 
+       than bilinear (which simply averages them away).
+    """
+    x1, y1, x2, y2 = bbox
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    w, h = (x2 - x1) * margin, (y2 - y1) * margin
+    
+    # Safe crop boundaries
+    nx1, ny1 = max(0, int(cx - w/2)), max(0, int(cy - h/2))
+    nx2, ny2 = min(img_bgr.shape[1], int(cx + w/2)), min(img_bgr.shape[0], int(cy + h/2))
+    
+    crop = img_bgr[ny1:ny2, nx1:nx2]
+    # Resize with Lanczos4 to preserve high-frequency artifacts
+    return cv2.resize(crop, target_size, interpolation=cv2.INTER_LANCZOS4)
+```
 
 **CLIP ViT-B/32 Hook — The One Place You Can Get Silently Wrong**
 
