@@ -494,7 +494,7 @@ flowchart TD
         RPPG["🫀 run_rppg()\nInput: N frames 30fps\nOutput: liveness bool, variance, SNR\nTime: ~2s"]
         DCT["🔬 run_dct()\nInput: grayscale image\nOutput: grid_artifacts bool, score\nTime: ~0.3s"]
         GEO["📐 run_geometry()\nInput: landmarks 68×2\nOutput: violations list, fake_score\nTime: ~0.2s"]
-        ILLUM["🌅 run_illumination()\nInput: face_crop, full_frame, landmarks\nOutput: direction_mismatch°, fake_score\nTime: ~0.5s"]
+        ILLUM["🌅 run_illumination()\nInput: face_crop, landmarks\nOutput: direction_mismatch°, score\nTime: ~0.5s"]
     end
 
     subgraph GPU_TOOLS["🖥️ GPU TOOLS — Sequential Loading"]
@@ -2022,25 +2022,23 @@ def sbi_ensemble_contribution(
     dct_double_quant: float,
 ) -> tuple[float, float]:
 
-    # Blind spot — no blend boundary signal at all
     if sbi_score < 0.30:
-        return 0.0
+        return (0.0, 0.0)
 
     # High confidence face-swap detected
     if sbi_score > 0.80:
-        base = sbi_score * 0.20
+        eff_w = 0.20
+        if dct_double_quant > 0.70:
+            eff_w *= 0.40
+        return (sbi_score * eff_w, eff_w)
 
     # Middle band — continuous blend using CLIP as context
     else:
         clip_factor    = max(0.0, min(1.0, clip_score))
-        dynamic_weight = 0.03 + (0.12 * clip_factor)
-        base           = sbi_score * dynamic_weight
-
-    # DCT discount — heavy compression makes SBI unreliable
-    if dct_double_quant > 0.70:
-        base *= 0.40
-
-    return (base, eff_w if sbi_score >= 0.30 else 0.0)
+        eff_w          = 0.03 + (0.12 * clip_factor)
+        if dct_double_quant > 0.70:
+            eff_w *= 0.40
+        return (sbi_score * eff_w, eff_w)
 ```
 
 **SBI Design Decisions (Locked)**
@@ -2283,16 +2281,16 @@ def freqnet_ensemble_contribution(
     dct_double_quant: float,   # from DCT tool at pipeline position [3]
 ) -> tuple[float, float]:
 
-    base = freq_score * 0.20
+    eff_w = 0.20
 
     # Frequency stream is directly disrupted by DCT re-quantization.
     # Steeper discount than SBI (0.40) because FreqNet's
     # frequency stream is fundamentally more sensitive to
     # compression artifacts than SBI's spatial boundary detection.
     if dct_double_quant > 0.70:
-        base *= 0.50
+        eff_w *= 0.50
 
-    return (base, 0.20 if dct_double_quant <= 0.70 else 0.10)
+    return (freq_score * eff_w, eff_w)
 ```
 
 **FreqNet Design Decisions Summary**
