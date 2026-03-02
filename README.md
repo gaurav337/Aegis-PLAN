@@ -607,7 +607,9 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 │         │           │ │  the hairline region. FreqNet        │  │
 │         │           │ │  detection confirmed GAN fingerprints." │  │
 │         │           │ │ Tools used: [check_c2pa, run_rppg,     │  │
-│         │           │ │  run_clip_adapter, run_freqnet]         │  │
+│         │           │ │  run_dct, run_geometry,               │  │
+│         │           │ │  run_illumination, run_clip_adapter,  │  │
+│         │           │ │  run_freqnet]                           │  │
 │         │           │ │ Tools skipped: [run_sbi]                     │  │
 │         │           │ └─────────────────────────────────────────┘  │
 │         │           │ → 1 tool skipped via early stopping          │
@@ -616,7 +618,7 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-> **Key insight:** A traditional pipeline would have run all 7 tools. The agent stopped after 4 because confidence exceeded the 0.85 threshold, saving ~50% of compute time.
+> **Key insight:** A traditional pipeline would have run all 8 tools. The agent skipped SBI because the CLIP score > 0.7 indicated a fully-synthetic face (not a face-swap), which is outside SBI's detection domain. Stop early logic combined with conditional branching optimizes the diagnostic flow.
 
 ---
 
@@ -2827,8 +2829,9 @@ tools:
 
   geometry:
     enabled: true
-    # Checks: ipd_ratio, eye_symmetry, facial_thirds,
-    #         nasolabial_folds, head_pose, pupil_nostril
+    # Checks: ipd_ratio, philtrum_ratio, eye_width_asymmetry,
+    #         jaw_yaw_symmetry, nose_width_ratio,
+    #         mouth_width_ratio, vertical_thirds
     violation_threshold: 2   # flag if 2+ checks fail
 
   illumination:
