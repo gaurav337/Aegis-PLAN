@@ -7,7 +7,7 @@
 #### Prompt for Day 6:
 
 **Section A: Context Reminder**
-You are building Aegis-X, an agentic deepfake detection system. We have completed the base infrastructure, configuration, preprocessing (dlib crops), and `BaseForensicTool`. 
+You are building Aegis-X, an agentic deepfake detection system. We have completed the base infrastructure, configuration, preprocessing (**MediaPipe 478-point** crops), and `BaseForensicTool`.
 This is Phase 2, Day 6. We are building the first of the 5 CPU-only tools: The C2PA Provenance Tool. It's unique because it returns a binary verification rather than a floating-point anomaly score.
 
 **Section B: Today's Objectives**
@@ -90,12 +90,12 @@ This is Phase 2, Day 7. Today we implement the POS (Plane Orthogonal to Skin-ton
   - `@property tool_name`: return `"run_rppg"`
   - `def setup(self)`: No-op.
    - `def _extract_forehead_roi(self, frame: np.ndarray, landmarks: np.ndarray) -> np.ndarray`:
-     Extract the forehead region using **dlib 68-point landmarks 19-24** (eyebrow upper boundary).
-     Compute bbox from landmarks 19-24, extend upward by 50% of the eye-to-brow distance, clamp to image boundaries.
-     Return the cropped forehead ROI. Forehead is chosen because it has minimal muscle movement and good blood flow visibility.
+     Extract the forehead region using **MediaPipe dense upper-head polygon: nodes 10, 338, 297, 332, 284, 103, 67** (the upper hairline band). Compute bbox from these landmarks, clamp to image boundaries, return the cropped ROI.
+     **CRITICAL — Hair Occlusion Guardrail:** Because this ROI sits very high and dense, subjects with bangs (hair covering forehead) produce noisy high-variance signals that corrupt the POS algorithm. Before running POS, compute the **RGB variance** (standard deviation across all pixels in the ROI). If `np.std(roi_pixels) > 35.0`, the ROI is hair-contaminated — return `"AMBIGUOUS"` immediately without running POS. This prevents false NO_PULSE verdicts on subjects with bangs.
    - `def _run_inference(self, input_data: dict) -> ToolResult`:
-     - `input_data` MUST contain `"frames_30fps"` (list of RGB frames at 30fps) AND `"landmarks"` (68-point dlib landmarks from winning frame).
+     - `input_data` MUST contain `"frames_30fps"` (list of RGB frames at 30fps) AND `"landmarks"` (**478-point** MediaPipe landmarks from winning frame, shape `(478, 2)`).
      - Requirements: `min_frames = 90` (from `utils/thresholds.py`). If `<90`, return neutral result (`score=0.5, confidence=0.0`).
+     - **Step 0: Hair Occlusion Guardrail** — Call `_extract_forehead_roi` on Frame 0. If it returns `"AMBIGUOUS"`, immediately return `score=0.5, confidence=0.0, evidence_summary="Ambiguous: forehead ROI shows high texture variance (likely hair occlusion). Cannot extract rPPG signal."`
      - **Step 1: Extract temporal RGB signal**
        For each frame, extract the forehead ROI using `_extract_forehead_roi` with the initial face bbox as a static cookie-cutter (not re-detecting per frame).
        Compute spatial mean RGB values -> `(N, 3)` matrix.
@@ -142,7 +142,7 @@ def test_day7():
     # Create fake "flatline" video data (100 frames of 50x50 RGB noise with 0 biological variation)
     np.random.seed(42)
     fake_frames = [np.random.randint(100, 110, (50, 50, 3), dtype=np.uint8) for _ in range(100)]
-    dummy_landmarks = np.zeros((68, 2))  # dlib 68-point only, no MediaPipe
+    dummy_landmarks = np.zeros((478, 2))  # MediaPipe 478-point format
     
     result = tool.execute({"frames_30fps": fake_frames, "landmarks": dummy_landmarks})
     
@@ -254,8 +254,8 @@ Expected output: Success message confirming the algorithm differentiates smooth 
 #### Prompt for Day 9:
 
 **Section A: Context Reminder**
-Aegis-X checks whether facial structures adhere to anatomical physics. Generative models hallucinative visual textures but often fail basic 3D human constraints. 
-This is Phase 2, Day 9. We are implementing 7 explicit anthropometric measurements on the extracted `dlib` landmarks. This tool is a cornerstone of our zero-shot physics defense.
+Aegis-X checks whether facial structures adhere to anatomical physics. Generative models hallucinate visual textures but often fail basic 3D human constraints.
+This is Phase 2, Day 9. We are implementing 7 explicit anthropometric measurements on the extracted **MediaPipe 478-point** landmarks. This tool is a cornerstone of our zero-shot physics defense.
 
 **Section B: Today's Objectives**
 - Create `core/tools/geometry_tool.py`, extending `BaseForensicTool`.
@@ -264,24 +264,25 @@ This is Phase 2, Day 9. We are implementing 7 explicit anthropometric measuremen
 - `GeometryTool(BaseForensicTool)`:
   - `@property tool_name`: return `"run_geometry"`
   - `def _run_inference(self, input_data: dict) -> ToolResult`:
-    - Reads `landmarks` (np.ndarray of shape [68, 2]) from `input_data`. If None, return neutral result `score=0.5`.
+    - Reads `landmarks` (np.ndarray of shape **[478, 2]**, MediaPipe pixel coordinates) from `input_data`. If None, return neutral result `score=0.5`.
     - Function: `def dist(a, b): return np.linalg.norm(np.array(a) - np.array(b))`
-    - You MUST implement EXACTLY these 7 distinct checks using `dist`:
-      1. **IPD ratio**: `dist(landmarks[36], landmarks[45]) / dist(landmarks[0], landmarks[16])`. Uses outer eye corners (pupil proxy), NOT mean of all eye landmarks. Valid: 0.42 to 0.52.
-      2. **Philtrum ratio**: `dist(landmarks[33], landmarks[51]) / dist(landmarks[27], landmarks[8])`. Valid: 0.10 to 0.15.
-      3. **Eye width asymmetry**: `abs(dist(lm[36], lm[39]) - dist(lm[42], lm[45])) / dist(landmarks[0], landmarks[16])`. Flag if > 0.05.
-      4. **Jaw yaw symmetry**: Anchor at nose (`lm[27]`). `yaw_proxy = abs(dist(lm[27], lm[0]) - dist(lm[27], lm[16])) / dist(lm[0], lm[16])`. Flag if > 0.08. 
-      - **CRITICAL**: If `yaw_proxy > 0.15` (meaning the face is profiled/turned significantly), MUST SKIP bilateral symmetry Checks 3, 4, 5, and 6, as 2D projections of bilateral widths artificially skew when yawed.
-      5. **Nose width ratio**: `dist(lm[31], lm[35]) / IPD`. Valid: 0.55 to 0.70.
-      6. **Mouth width ratio**: `dist(lm[48], lm[54]) / IPD`. Valid: 0.85 to 1.05.
-      7. **Vertical thirds**: `upper = lm[19] to lm[27]`, `mid = lm[27] to lm[33]`, `lower = lm[33] to lm[8]`. Check if any deviate by > 15% from the average third.
+    - You MUST implement EXACTLY these **7 distinct checks** using `dist` with **MediaPipe landmark indices**:
+      1. **IPD ratio**: `dist(landmarks[33], landmarks[263]) / dist(landmarks[234], landmarks[454])`. Uses MediaPipe outer iris centers (nodes 33/263), divided by jaw-width (234/454). Valid: 0.42 to 0.52.
+      2. **Philtrum ratio**: `dist(landmarks[94], landmarks[0]) / dist(landmarks[168], landmarks[152])`. MediaPipe: columella base (94), lip midpoint (0), nose bridge (168), chin (152). Valid: 0.10 to 0.15.
+      3. **Eye width asymmetry**: `abs(dist(lm[33], lm[133]) - dist(lm[263], lm[362])) / dist(lm[234], lm[454])`. MediaPipe left eye outer/inner corners vs right eye. Flag if > 0.05.
+      4. **Jaw yaw symmetry (Pose Gate)**: `yaw_proxy = abs(eye_mid_x - landmarks[1].x) / face_width` where `eye_mid_x = (landmarks[33].x + landmarks[263].x) / 2`, `face_width = dist(landmarks[234], landmarks[454])`.
+         - **CRITICAL**: If `yaw_proxy > GEOMETRY_YAW_SKIP_THRESHOLD (0.18)`, skip bilateral Checks 3, 4, 5, and 6 (face is too profiled for 2D bilateral measurements to be reliable). Checks 1, 2, and 7 always run.
+      5. **Nose width ratio**: `dist(lm[98], lm[327]) / IPD`. MediaPipe alar base nodes 98 (left), 327 (right). Valid: 0.55 to 0.70.
+      6. **Mouth width ratio**: `dist(lm[61], lm[291]) / IPD`. MediaPipe mouth corner nodes 61 (left), 291 (right). Valid: 0.85 to 1.05.
+      7. **Vertical thirds**: `upper = lm[10] to lm[168]` (hairline to nose bridge), `mid = lm[168] to lm[94]` (nose bridge to columella), `lower = lm[94] to lm[152]` (columella to chin). Check if any third deviates by > 15% from the mean third.
     - Each check that fails adds a string to a `violations` list.
     - `fake_score = len(violations) / 7.0`
     - `confidence = 0.8` (if landmarks exist).
     - `evidence_summary`: Include strings of EXACTLY which anatomical structures are violating constraints (e.g., "Violations found in Jaw yaw symmetry and Philtrum ratio.").
 
 **Section D: Implementation Rules for That Day**
-- Use precise indexing on the [68, 2] array.
+- Use precise indexing on the `[478, 2]` MediaPipe array.
+- Import `GEOMETRY_YAW_SKIP_THRESHOLD` from `utils/thresholds.py` — do NOT hardcode `0.18`. This is the single source of truth.
 - Catch `ZeroDivisionError` natively with `+ 1e-10` on all denominators.
 
 **Section E: Testing & Verification Steps**
@@ -293,23 +294,27 @@ from core.tools.geometry_tool import GeometryTool
 def test_day9():
     tool = GeometryTool()
     
-    # Generate a PERFECTLY symmetrical dummy face grid matching the expected bounds roughly
-    landmarks = np.zeros((68, 2))
-    landmarks[0] = [0, 50]       # left jaw
-    landmarks[16] = [100, 50]    # right jaw
-    landmarks[36] = [25, 25]     # left eye outer
-    landmarks[39] = [40, 25]     # left eye inner
-    landmarks[42] = [60, 25]     # right eye inner
-    landmarks[45] = [75, 25]     # right eye outer
-    landmarks[27] = [50, 40]     # nose bridge
-    landmarks[31] = [40, 60]     # left nostril
-    landmarks[33] = [50, 60]     # nose tip
-    landmarks[35] = [60, 60]     # right nostril
-    landmarks[51] = [50, 65]     # lip top
-    landmarks[48] = [30, 70]     # mouth left
-    landmarks[54] = [70, 70]     # mouth right
-    landmarks[8] = [50, 100]     # chin
-    landmarks[19] = [30, 10]     # left brow
+    # MediaPipe 478-point layout (approximate positions for testing)
+    landmarks = np.zeros((478, 2))
+    # Face width: jaw nodes 234 (left ear) and 454 (right ear)
+    landmarks[234] = [0, 50]      # left jaw (ear level)
+    landmarks[454] = [100, 50]    # right jaw (ear level)
+    # Eye outer corners
+    landmarks[33]  = [25, 25]     # left eye outer
+    landmarks[133] = [40, 25]     # left eye inner
+    landmarks[263] = [60, 25]     # right eye inner
+    landmarks[362] = [75, 25]     # right eye outer
+    # Nose tip and structural landmarks
+    landmarks[1]   = [50, 50]     # nose tip (yaw probe)
+    landmarks[168] = [50, 15]     # nose bridge (for vertical thirds upper)
+    landmarks[94]  = [50, 60]     # columella base
+    landmarks[98]  = [40, 62]     # left alar base (nose width)
+    landmarks[327] = [60, 62]     # right alar base (nose width)
+    # Mouth corners
+    landmarks[61]  = [30, 70]     # mouth left
+    landmarks[291] = [70, 70]     # mouth right
+    landmarks[152] = [50, 100]    # chin
+    landmarks[10]  = [50, 5]      # hairline top
     
     result = tool.execute({"landmarks": landmarks})
     print(f"Geometry Score: {result.score}")
@@ -325,12 +330,12 @@ Expected output: The algorithm parses the synthetic array, calculates ratios, de
 
 **Section F: Files Produced**
 - `core/tools/geometry_tool.py`
-- Depends on: valid [68, 2] landmarks from Preprocessor.
+- Depends on: valid **[478, 2]** MediaPipe landmarks from Preprocessor.
 - Enables: High success rate against AI generators that fail 3D anatomical layout.
 
 #### Day 9 Summary:
 - Files: core/tools/geometry_tool.py
-- Depends on: Preprocessor (dlib landmarks)
+- Depends on: Preprocessor (MediaPipe 478-point landmarks)
 - Enables: Zero-shot anatomical physics verification.
 
 ---
@@ -439,11 +444,12 @@ This is Phase 2, Day 10.5. We are building a physics-based corneal reflection co
   - `@property tool_name`: return `"run_corneal"`
   - `def _run_inference(self, input_data: dict) -> ToolResult`:
     1. Read `input_data["face_crop_224"]` and `input_data["landmarks"]`. If either is None, return abstention (`score=0.0, error=True`).
-    2. Extract eye ROIs via landmarks 36-41 (left eye) and 42-47 (right eye).
-    3. Within each eye ROI, threshold for specular highlights (brightest pixels, top 2%).
-    4. If no catchlight detected in either eye → return `error=True` (abstention, weight 0.0 in ensemble).
-    5. Compute spatial centroid offsets for left and right eye catchlights.
-    6. Apply mirror-axis correction (left/right eye reflection rays are symmetric about the nose bridge).
+    2. Extract **iris center regions** using **MediaPipe iris nodes 468 (left iris center) and 473 (right iris center)**. Each iris node gives a pixel coordinate. Extract a **15×15 pixel box** centered on each iris node from the native-resolution face crop (scaled to crop coordinates first).
+       - Do NOT use eye boundary points; these are not corneal center trackable positions.
+    3. Within each 15×15 box, threshold for specular highlights (brightest pixels, top 2%).
+    4. If no catchlight detected in either iris region → return `error=True` (abstention, weight 0.0 in ensemble).
+    5. Compute spatial centroid offsets for left and right iris catchlights.
+    6. Apply mirror-axis correction (left/right iris reflection rays are symmetric about nose node 1).
     7. Measure divergence: `divergence = ||left_offset - right_offset||`.
     8. `fake_score = min(1.0, divergence / max_allowable_divergence)`.
     9. `consistent = fake_score < 0.5`.
@@ -482,7 +488,7 @@ Expected output: Tool returns without crashing, likely abstaining (no catchlight
 
 **Section F: Files Produced**
 - `core/tools/corneal_tool.py`
-- Depends on: cv2, numpy, dlib landmarks
+- Depends on: cv2, numpy, **MediaPipe iris nodes 468/473** (requires `refine_landmarks=True` in Preprocessor)
 - Enables: Physics-based catch for diffusion model eye artifacts.
 
 #### Day 10.5 Summary:

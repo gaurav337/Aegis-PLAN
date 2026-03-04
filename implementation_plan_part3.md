@@ -39,14 +39,14 @@ This is the most architecturally complex tool in Aegis-X. It consists of a froze
     - Return `(clip_model, adapter)`.
 
 **Stage 0: Landmark Crop Extraction** (`landmark_crops.py`):
-  - Input: frame `(H,W,3)` + landmarks `(68,2)`
+  - Input: frame `(H,W,3)` + landmarks `(478,2)`
   - Extract **6 anatomical crops**, each targeting a region where forgery artifacts concentrate:
-    - `[0] left_periorbital` (landmarks 36-41)
-    - `[1] right_periorbital` (landmarks 42-47)
-    - `[2] nasolabial_left` (landmarks 31, 48, 49, 50)
-    - `[3] nasolabial_right` (landmarks 35, 54, 55, 56)
-    - `[4] hairline_band` (top 15% of face bbox)
-    - `[5] chin_jaw` (landmarks 4-12)
+    - `[0] left_periorbital` (landmarks 33,133,160,159,158,144)
+    - `[1] right_periorbital` (landmarks 263,362,385,386,387,373)
+    - `[2] nasolabial_left` (landmarks 92, 205, 216, 206)
+    - `[3] nasolabial_right` (landmarks 322, 425, 436, 426)
+    - `[4] hairline_band` (landmarks 10, 338, 297, 332, 284, 103, 67)
+    - `[5] chin_jaw` (landmarks 172,136,150,149,176,148,152,377,400,379,365)
   - Per crop: compute bbox from landmarks → pad 20% → clamp to image boundaries → extract at native resolution → resize to 224×224 using `cv2.INTER_LANCZOS4` → apply CLIP normalization (mean `[0.48145466, 0.4578275, 0.40821073]`, std `[0.26862954, 0.26130258, 0.27577711]`) → output `(1, 3, 224, 224)` tensor.
 
 **Stage 1: Patch Token Extraction** (`patch_extractor.py`):
@@ -173,16 +173,16 @@ This is Phase 3, Day 12. We are implementing the SBI (Self-Blended Images) detec
     - Wrap inference: `with VRAMLifecycleManager(self._load_model) as model:`
 
     **Dual-Scale Cropping:**
-    - Compute face bbox from landmarks → extract TWO context-expanded crops:
-      - 1.3× scale: `bbox expanded by 30%` → captures tight context around face
-      - 1.4× scale: `bbox expanded by 40%` → captures wider context (catches different mask sizes)
+    - Compute face bbox from MediaPipe 478 landmarks (which inherently includes the whole head/forehead). Extract TWO context-expanded crops:
+      - **1.15× scale**: `bbox expanded by 15%` → captures tight context around FaceMesh
+      - **1.25× scale**: `bbox expanded by 25%` → captures wider context (catches different mask sizes)
       - Both: native crop → Lanczos4 → 380×380 → ImageNet normalize (NOT CLIP normalize)
       - **CRITICAL**: Use `torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float() / 255.0` → ImageNet means `[0.485, 0.456, 0.406]`, stds `[0.229, 0.224, 0.225]`
 
     **Pass 1: Fast Scoring (torch.no_grad):**
-    - `score_130 = model(tensor_1_3x).sigmoid()` — ⚠ Check if checkpoint final layer already includes sigmoid. If `nn.Sigmoid` found: skip `.sigmoid()`. If `nn.Linear`: apply. Double-sigmoid clusters scores near 0.5.
-    - `score_140 = model(tensor_1_4x).sigmoid()`
-    - `max_score = max(score_130, score_140)`
+    - `score_115 = model(tensor_1_15x).sigmoid()` — ⚠ Check if checkpoint final layer already includes sigmoid. If `nn.Sigmoid` found: skip `.sigmoid()`. If `nn.Linear`: apply. Double-sigmoid clusters scores near 0.5.
+    - `score_125 = model(tensor_1_25x).sigmoid()`
+    - `max_score = max(score_115, score_125)`
     - `winning_tensor = tensor with higher score`
 
     **Conditional GradCAM (Pass 2, only if max_score > 0.60):**
@@ -194,14 +194,14 @@ This is Phase 3, Day 12. We are implementing the SBI (Self-Blended Images) detec
       `cam = ReLU(Σ weights × activations)` → `(1, 12, 12)` → normalize to [0,1] → bilinear upsample to 380×380.
 
     **Region Mapping:**
-    - Transform landmarks to 380×380 crop coordinates.
-    - Define regions: jaw (landmarks 1-5, 11-15), hairline (top 15%), cheek (1-3, 15-17), nose_bridge (27-30).
+    - Transform 478 MediaPipe landmarks to 380×380 crop coordinates.
+    - Define regions using MediaPipe indices: jaw (`172, 136, 150, 149, 176, 148, 152, 377, 400, 379, 365`), hairline (`10, 338, 297, 332, 284, 103, 67`), cheek (`234, 93, 132, 58, 454, 323, 361, 288`), nose_bridge (`168, 6, 197, 195`).
     - Highest mean CAM value in region → `boundary_region` name.
     - If highest mean < `SBI_GRADCAM_REGION_THRESHOLD (0.40)` → "diffuse" (no clear boundary).
 
     **Output:**
-    `{fake_score, boundary_detected, boundary_region, winning_scale, scores_per_scale: {"1.3x": float, "1.4x": float}, interpretation, compute_ms}`
-    - `evidence_summary`: "SBI detector: blend boundary detected at jaw (score: 0.84, scale: 1.4x). Consistent with face-swap compositing artifact." OR "SBI detector: no blend boundary detected (score: 0.31). Does not exclude fully-synthetic generation (Sora, Midjourney)." ← Critical: prevents Phi-3 from treating low SBI as evidence of authenticity.
+    `{fake_score, boundary_detected, boundary_region, winning_scale, scores_per_scale: {"1.15x": float, "1.25x": float}, interpretation, compute_ms}`
+    - `evidence_summary`: "SBI detector: blend boundary detected at jaw (score: 0.84, scale: 1.25x). Consistent with face-swap compositing artifact." OR "SBI detector: no blend boundary detected (score: 0.31). Does not exclude fully-synthetic generation (Sora, Midjourney)." ← Critical: prevents Phi-3 from treating low SBI as evidence of authenticity.
 
 **Section D: Implementation Rules for That Day**
 - Do not forget the conditional skip based on the `clip_score`. This is a critical piece of the 'agent' architecture.

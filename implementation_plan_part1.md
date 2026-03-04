@@ -4,7 +4,7 @@
 | Phase | Name | Days | Key Deliverables |
 |---|---|---|---|
 | 0 | Project Scaffolding & Configuration | 1–2 | Repository structure, config.py, custom exceptions, logger setup, ToolResult dataclass, abstract base tool |
-| 1 | Utilities & Preprocessing Pipeline | 3–5 | image.py, video.py, preprocessing.py (dlib face/landmark extraction), vram_manager.py |
+| 1 | Utilities & Preprocessing Pipeline | 3–5 | image.py, video.py, preprocessing.py (MediaPipe face/landmark extraction), vram_manager.py |
 | 2 | CPU Forensic Tools | 6–10 | tools/c2pa_tool.py, rppg_tool.py, dct_tool.py, geometry_tool.py, illumination_tool.py, corneal_tool.py |
 | 3 | GPU Forensic Tools | 11–14 | tools/clip_adapter_tool.py, sbi_tool.py, freqnet_tool.py, tool_registry.py |
 | 4 | Ensemble, Early Stopping & Memory | 15–17 | utils/ensemble.py, core/early_stopping.py, core/memory.py |
@@ -34,14 +34,14 @@ This is Phase 0, Day 1: Project Scaffolding & Configuration. Nothing exists yet.
 
 **Section C: Detailed Specifications**
 1. `requirements.txt`: 
-   Define the following packages (use reasonable recent versions): `dlib`, `torch`, `torchvision`, `torchaudio`, `torchcodec>=0.9.0`, `insightface`, `c2pa-python`, `scipy`, `numpy`, `opencv-python`, `streamlit`, `gradio`, `httpx`, `pydantic`, `python-dotenv`.
+   Define the following packages (use reasonable recent versions): `mediapipe`, `torch`, `torchvision`, `torchaudio`, `torchcodec>=0.9.0`, `insightface`, `c2pa-python`, `scipy`, `numpy`, `opencv-python`, `streamlit`, `gradio`, `httpx`, `pydantic`, `python-dotenv`.
 
 2. `.env.example`:
    Keys to include: `AEGIS_MODEL_DIR=models/`, `AEGIS_DEVICE=auto`, `OLLAMA_ENDPOINT=http://localhost:11434`, `LOG_LEVEL=INFO`.
 
 3. `core/config.py`:
    Use `dataclasses` to define the configuration hierarchy:
-   - `ModelPaths`: fields: `phi3_model` (str), `clip_adapter_weights` (str), `sbi_weights` (str), `freqnet_weights` (str), `dlib_shape_predictor` (str).
+   - `ModelPaths`: fields: `phi3_model` (str), `clip_adapter_weights` (str), `sbi_weights` (str), `freqnet_weights` (str).
    - `AgentConfig`: fields: `max_retries` (int, default=3), `llm_timeout` (int, default=120), `ollama_endpoint` (str, default="http://localhost:11434").
    - `EnsembleWeights`: EXACT default values: `clip_adapter=0.30`, `sbi=0.20`, `freqnet=0.20`, `rppg=0.15`, `dct=0.10`, `geometry=0.03`, `illumination=0.02`. (Note: C2PA is binary and not weighted).
    - `ThresholdConfig`: EXACT default values: `real_threshold` (float, default=0.15), `fake_threshold` (float, default=0.85), `early_stop_confidence` (float, default=0.85). Optional: add `sbi_skip_clip_threshold` (default=0.70).
@@ -75,7 +75,7 @@ This is Phase 0, Day 1: Project Scaffolding & Configuration. Nothing exists yet.
    - FreqNet: `FREQNET_FAKE_THRESHOLD = 0.65`, `FREQNET_Z_THRESHOLD = 1.5`
    - rPPG: `RPPG_PULSE_PRESENT_THRESHOLD = 0.70`, `RPPG_NO_PULSE_THRESHOLD = 0.30`, `RPPG_SNR_THRESHOLD = 3.0`, `RPPG_MIN_FRAMES = 90`
    - DCT: `DCT_DOUBLE_QUANT_COMPRESSION_THRESHOLD = 0.70`
-   - Geometry: `GEOMETRY_YAW_SKIP_THRESHOLD = 0.15`
+   - Geometry: `GEOMETRY_YAW_SKIP_THRESHOLD = 0.18`  # Recalibrated from 0.15: MediaPipe jaw nodes 234/454 sit near ear tragus — wider denominator requires higher threshold to maintain equivalent angular sensitivity
    - Illumination: `ILLUMINATION_DIFFUSE_THRESHOLD = 0.05`
    - Ensemble discounts: `SBI_COMPRESSION_DISCOUNT = 0.40`, `FREQNET_COMPRESSION_DISCOUNT = 0.50`
    - Ensemble weights: `WEIGHT_CLIP = 0.30`, `WEIGHT_SBI = 0.20`, `WEIGHT_FREQNET = 0.20`, `WEIGHT_RPPG = 0.15`, `WEIGHT_DCT = 0.10`, `WEIGHT_GEOMETRY = 0.03`, `WEIGHT_ILLUMINATION = 0.02`, `WEIGHT_CORNEAL = 0.03`
@@ -300,60 +300,69 @@ Expected output: Confirms frame limits and 3-channel (RGB) shape on a sample vid
 
 **Section A: Context Reminder**
 Aegis-X requires strictly formatted face crops and native resolution patches to feed its physics and GPU tools. Hand-crafting the spatial boundaries is critical to system success.
-This is Phase 1, Day 4. We are leveraging `dlib` to build a 68-point landmark extractor and patch generator.
+This is Phase 1, Day 4. We are leveraging **MediaPipe Face Mesh** (`refine_landmarks=True`, 478 points) to build a landmark extractor and patch generator.
 
 **Section B: Today's Objectives**
 - Create `utils/preprocessing.py`.
 - Define the `PreprocessResult` dataclass.
-- Build the `Preprocessor` class using `dlib` to extract standard face crops and exact anatomical patches.
+- Build the `Preprocessor` class using **MediaPipe Face Mesh** (`refine_landmarks=True`) to extract standard face crops and exact anatomical patches.
 
 **Section C: Detailed Specifications**
 1. `PreprocessResult` dataclass:
    Fields exactly as follows:
    - `has_face`: bool
-   - `landmarks`: np.ndarray of shape `[68, 2]`, or None
+   - `landmarks`: np.ndarray of shape **`[478, 2]`** (MediaPipe Face Mesh with `refine_landmarks=True`), or None
+     - Includes iris and pupil nodes 468–477, required by corneal and IPD checks.
    - `face_crop_224`: np.ndarray (for CLIP/FreqNet), or None
    - `face_crop_380`: np.ndarray (for SBI), or None
-   - `patch_left_periorbital`: np.ndarray (224x224, landmarks 36–41), or None
-   - `patch_right_periorbital`: np.ndarray (224x224, landmarks 42–47), or None
-   - `patch_nasolabial_left`: np.ndarray (224x224, landmarks 31, 48, 49, 50), or None
-   - `patch_nasolabial_right`: np.ndarray (224x224, landmarks 35, 54, 55, 56), or None
-   - `patch_hairline_band`: np.ndarray (224x224, top 15% of face bbox), or None
-   - `patch_chin_jaw`: np.ndarray (224x224, landmarks 4–12), or None
+   - `patch_left_periorbital`: np.ndarray (224x224, MediaPipe left-eye boundary nodes `33,133,160,159,158,144`), or None
+   - `patch_right_periorbital`: np.ndarray (224x224, MediaPipe right-eye boundary nodes `263,362,385,386,387,373`), or None
+   - `patch_nasolabial_left`: np.ndarray (224x224, MediaPipe nodes `92, 205, 216, 206`), or None
+   - `patch_nasolabial_right`: np.ndarray (224x224, MediaPipe nodes `322, 425, 436, 426`), or None
+   - `patch_hairline_band`: np.ndarray (224x224, MediaPipe hairline nodes `10, 338, 297, 332, 284, 103, 67`), or None
+   - `patch_chin_jaw`: np.ndarray (224x224, MediaPipe mandibular contour nodes `172,136,150,149,176,148,152,377,400,379,365`), or None
    - `frames_30fps`: list[np.ndarray], or None (All extracted frames if video)
    - `selected_frame_index`: int
    - `selected_frame_sharpness`: float
    - `original_media_type`: str ("image" or "video")
 
 2. `Preprocessor` class:
-   - `__init__(self, config: PreprocessingConfig, shape_predictor_path: Path)`: 
-     Load `dlib.get_frontal_face_detector()` and `dlib.shape_predictor(str(shape_predictor_path))`. No MediaPipe — all landmark operations use dlib 68-point only.
-   - `_get_landmarks(self, image: np.ndarray) -> np.ndarray | None`: 
-     Run detector. If multiple faces are found, select the one with the largest bounding box area. If face found, run predictor. Return exactly 68 `(x, y)` coordinates as a numpy array.
-    - `_crop_align(self, image: np.ndarray, landmarks: np.ndarray, size: int) -> np.ndarray`: 
-      Extract bounding box containing all 68 landmarks, add 20% margin, crop at **native resolution**, and resize to `(size, size)`. **CRITICAL**: Use `cv2.INTER_LANCZOS4` (sinc kernel, 8x8 pixel neighborhood) -- NOT `INTER_AREA` or bilinear. Lanczos preserves 1-8px high-frequency GAN/diffusion artifacts that INTER_AREA averaging destroys.
+   - `__init__(self, config: PreprocessingConfig)`:
+     Initialize `mp.solutions.face_mesh.FaceMesh(
+         static_image_mode=True,
+         refine_landmarks=True,       # CRITICAL: enables iris nodes 468-477
+         max_num_faces=1,
+         min_detection_confidence=0.5
+     )`.
+   - `_get_landmarks(self, image: np.ndarray) -> np.ndarray | None`:
+     Call `mp_face_mesh.process(image_rgb)`. If `multi_face_landmarks` is populated, take the first result. Extract all 478 `(x, y)` coordinates as pixel values (multiply normalized coords by `W` and `H`). If the image contains multiple faces, select the face whose bounding-box area is largest. Return exactly `(478, 2)` float32 array, or `None` if no face detected.
+     **Edge cases:**
+     - Extreme yaw (>60°): MediaPipe may still return partial landmarks. Always validate that nose-tip node 1 and jaw nodes 234/454 are within image bounds before using.
+     - Return `None` cleanly if `multi_face_landmarks` is empty — do NOT crash.
+   - `_crop_align(self, image: np.ndarray, landmarks: np.ndarray, size: int) -> np.ndarray`:
+     Extract bounding box containing all 478 landmarks, add 20% margin, crop at **native resolution**, and resize to `(size, size)`. **CRITICAL**: Use `cv2.INTER_LANCZOS4` — preserves 1-8px high-frequency GAN/diffusion artifacts that INTER_AREA averaging destroys.
     - `_extract_native_patches(self, image: np.ndarray, landmarks: np.ndarray) -> tuple`:
       Extract **6 anatomical patches** at native resolution, resize each to 224x224 using `cv2.INTER_LANCZOS4`.
       These 6 crops map directly to the CLIP adapter's Stage 0 (`clip_adapter/landmark_crops.py`):
-      - `left_periorbital`: tightly bound `landmarks[36:42]` (left eye region) with 20% margin.
-      - `right_periorbital`: tightly bound `landmarks[42:48]` (right eye region) with 20% margin.
-      - `nasolabial_left`: tightly bound `landmarks[31, 48, 49, 50]` (left nasolabial fold) with 20% margin.
-      - `nasolabial_right`: tightly bound `landmarks[35, 54, 55, 56]` (right nasolabial fold) with 20% margin.
-      - `hairline_band`: top 15% of face bounding box (hair-skin transition zone).
-      - `chin_jaw`: tightly bound `landmarks[4:13]` (chin and jawline).
-      Each patch: compute bbox from landmarks -> pad 20% -> clamp to image boundaries -> extract at native res -> resize 224x224 via Lanczos4 -> return as uint8 RGB.
+      - `left_periorbital`:  tightly bound `landmarks[[33,133,160,159,158,144]]` (MediaPipe left eye contour) with 20% margin.
+      - `right_periorbital`: tightly bound `landmarks[[263,362,385,386,387,373]]` (MediaPipe right eye contour) with 20% margin.
+      - `nasolabial_left`:   tightly bound `landmarks[[92, 205, 216, 206]]` (MediaPipe left nasolabial fold) with 20% margin.
+      - `nasolabial_right`:  tightly bound `landmarks[[322, 425, 436, 426]]` (MediaPipe right nasolabial fold) with 20% margin.
+      - `hairline_band`:     tightly bound `landmarks[[10, 338, 297, 332, 284, 103, 67]]` (MediaPipe upper forehead — NOT top-15% pixel row).
+      - `chin_jaw`:          tightly bound `landmarks[[172,136,150,149,176,148,152,377,400,379,365]]` (MediaPipe mandibular contour).
+      Each patch: compute bbox from landmarks → pad 20% → clamp to image boundaries → extract at native res → resize 224x224 via Lanczos4 → return as uint8 RGB.
       **Do NOT** downscale the full frame before cropping.
    - `_select_sharpest_frame(self, frames: list[np.ndarray], face_rect) -> int`:
      Implement the Quality Snipe filter. Iterate over up to 5 evenly spaced frames from the list. Crop out the `face_rect` boundary, convert to `cv2.COLOR_RGB2GRAY`, and use `cv2.Laplacian` to compute the variance. Return the index of the highest variance (sharpest) frame.
    - `process_media(self, path: Path) -> PreprocessResult`:
-     Check if image or video. Use `utils.video.extract_frames` or `utils.image.load_image`. 
+     Check if image or video. Use `utils.video.extract_frames` or `utils.image.load_image`.
      If video:
      1. Extract all frames using `extract_frames()`.
-     2. Search up to the first 10 frames with `self.detector` to establish the primary face bounding box.
+     2. Search up to the first 10 frames with `_get_landmarks()` to establish the primary face bounding box.
      3. Call `_select_sharpest_frame()` using that bounding box to find the sharpest frame.
-     4. **CRITICAL:** Call `_get_landmarks` again on the *winning* frame to fix sub-pixel shifts caused by motion.
+     4. **CRITICAL:** Call `_get_landmarks` again on the *winning* frame to fix sub-pixel shifts caused by motion. Pass the winning frame as a fresh `static_image_mode=True` image — do NOT reuse cached landmark state from the search phase.
      5. Store all raw frames in `frames_30fps` for temporal tools (rPPG needs all frames at 30fps for POS pulse extraction).
-     6. Build all subsequent crops/patches exclusively from the *winning frame*'s image and aligned landmarks.
+     6. Build all subsequent crops/patches exclusively from the *winning frame*'s image and 478-point aligned landmarks.
      Populate and return the `PreprocessResult`.
 
 **Section D: Implementation Rules for That Day**
@@ -370,28 +379,33 @@ from utils.preprocessing import Preprocessor
 
 def test_day4():
     config = PreprocessingConfig()
-    model_path = Path("models/shape_predictor_68_face_landmarks.dat")
     try:
-        prep = Preprocessor(config, model_path)
-        print("✅ Preprocessor initialized successfully.")
+        prep = Preprocessor(config)
+        # Test on a synthetic RGB image:
+        import numpy as np
+        dummy_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        result = prep._get_landmarks(dummy_img)
+        # No face in blank image = should return None cleanly
+        assert result is None, "Expected None for blank image"
+        print("✅ Preprocessor initialized and returns None on blank image (no crash).")
     except Exception as e:
-        print(f"⚠️ Initialization failed (models missing?): {e}")
+        print(f"⚠️ Initialization failed (MediaPipe not installed?): {e}")
 
 if __name__ == "__main__":
     test_day4()
 ```
 Run `python test_day4.py`.
-Expected output: Verifies smooth initializtion if dlib predictor is present, checks shapes of returned arrays downstream.
+Expected output: MediaPipe initializes without error. `_get_landmarks` returns `None` on a blank image (no face) without crashing. If `mediapipe` is not installed, a clear `ImperError` is shown.
 
 **Section F: Files Produced**
 - `utils/preprocessing.py`
-- Depends on: `core/config.py`, `utils/image.py`, `utils/video.py`, `dlib`
-- Enables: Extracted crops to be fed into physics and GPU models downstream.
+- Depends on: `core/config.py`, `utils/image.py`, `utils/video.py`, `mediapipe`
+- Enables: Extracted 478-point landmark crops and patches to be fed into physics and GPU models downstream.
 
 #### Day 4 Summary:
 - Files: utils/preprocessing.py
 - Depends on: core/config.py, utils/image.py, utils/video.py
-- Enables: All Forensic Tools expecting standard crops and landmark coordinates.
+- Enables: All Forensic Tools expecting standard crops and 478-point landmark coordinates.
 
 ---
 

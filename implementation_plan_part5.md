@@ -298,7 +298,7 @@ Expected output: The dockerfile downloads dependencies and packages the code suc
 #### Prompt for Day 29:
 
 **Section A: Context Reminder**
-Aegis-X requires pre-trained PyTorch weights (FreqNet, SBI, ClipAdapter, Dlib).
+Aegis-X requires pre-trained PyTorch weights (FreqNet, SBI, ClipAdapter).
 This is Phase 7, Day 29. We need to automate fetching them before first run.
 
 **Section B: Today's Objectives**

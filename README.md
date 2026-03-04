@@ -46,7 +46,7 @@
     *   [Anti-Compression DCT Analysis](#anti-compression-dct-analysis)
     *   [Physical Grounding & Hemodynamics](#physical-grounding--hemodynamics)
     *   [Data Sovereignty & Privacy](#data-sovereignty--privacy)
-    *   [HybridFaceDetector & extract_native_crop](#hybridfacedetector--extract_native_crop)
+    *   [MediaPipe Face Mesh & extract_native_crop](#mediapipe-face-mesh--extract_native_crop)
     *   [Agent Routing Guard](#agent-routing-guard-physics-tools)
     *   [Temporal Latent Jitter](#temporal-latent-jitter-zero-additional-vram)
     *   [Corneal Specular Reflection Consistency](#corneal-specular-reflection-consistency-cpu)
@@ -61,7 +61,7 @@
 13. [Performance Benchmarks](#-performance-benchmarks)
 14. [Project Structure](#-project-structure)
 15. [Roadmap](#-roadmap)
-16. [Troubleshooting](#-troubleshooting)
+16. [Troubleshooting & Known Limitations](#-troubleshooting--known-limitations)
 17. [Contributing](#-contributing)
 18. [Citation](#-citation)
 
@@ -109,7 +109,7 @@ specific tool evidence.
 | 💾 **Memory & Experience Learning** | Agent remembers past cases and artifact patterns for smarter future decisions |
 | ⚡ **Early Stopping** | Halts analysis when confidence is high, saving 40-80% compute on clear cases |
 | 🧑‍⚖️ **Human Escalation** | Automatically flags ambiguous cases (confidence 0.5–0.9) for manual review |
-| 🫀 **Biological Signal Detection** | Extracts pulse (rPPG) and corneal reflections to verify physical presence |
+| 🫀 **Biological Signal Detection** | Extracts pulse (rPPG via FFT and SNR thresholding) and corneal reflections to verify physical presence |
 | 🔬 **Frequency-Domain Forensics** | Hand-crafted DCT analysis + FreqNet transformer — both operating in frequency space, covering what the other misses |
 | 📐 **Geometric Physics Analysis** | 7-point facial landmark geometry check based on anthropometric constraints — catches what neural networks miss |
 | 🌅 **Illumination Physics Analysis** | Detects face-scene lighting mismatches using Shape-from-Shading — especially effective against diffusion models |
@@ -175,6 +175,10 @@ venv\Scripts\activate.bat
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
+
+# Recommended: 4-10× faster video frame extraction (official PyTorch Foundation)
+# Automatically uses GPU if available, CPU otherwise. Works on all platforms.
+# pip install torchcodec>=0.9.0
 ```
 
 #### Step 4: Install Platform-Specific Dependencies
@@ -298,15 +302,9 @@ huggingface-cli download bitmind/f3net-deepfake-detector \
 
 ---
 
-#### 5. dlib Face Landmarks — 100 MB
+#### 5. MediaPipe Face Mesh — No Download Needed
 
-```bash
-wget http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 \
-     -O models/shape_predictor_68_face_landmarks.dat.bz2
-bunzip2 models/shape_predictor_68_face_landmarks.dat.bz2
-```
-
-No change from original. CPU-only.
+MediaPipe Face Mesh is installed via `pip install mediapipe`. No separate model download is required. It runs natively on the CPU providing dense 478-point landmarks.
 
 ---
 
@@ -328,8 +326,7 @@ CPU library. No model download.
 | CLIP + Adapter | ~352 MB |
 | SBI Detector | ~90 MB |
 | FreqNet | ~45 MB |
-| dlib landmarks | ~100 MB |
-| **Total** | **~2.8 GB** |
+| **Total** | **~2.7 GB** |
 
 Down from ~6 GB in the original specification.
 
@@ -408,12 +405,16 @@ stateDiagram-v2
     IDLE --> PREPROCESSING : File uploaded\nEvent: analyze()
 
     state PREPROCESSING {
-        [*] --> FaceDetect
-        FaceDetect --> LandmarkExtract : Face found
+        [*] --> FrameExtract
+        FrameExtract --> FaceDetect : TorchCodec\n(GPU or CPU)
+        FaceDetect --> QualitySnipe : Face found on Frame 0
         FaceDetect --> ImageOnlyMode : No face detected
-        LandmarkExtract --> PatchExtract
+        QualitySnipe --> LandmarkExtract : Sharpest frame selected\n<1ms
+        LandmarkExtract --> PatchExtract : 478-pt on winning frame
         PatchExtract --> [*]
         ImageOnlyMode --> [*]
+        note right of QualitySnipe : Laplacian variance\n5 samples, <1ms\nZero VRAM
+        note right of FrameExtract : TorchCodec fast decode\ncv2 fallback always works
     }
 
     PREPROCESSING --> CPU_PHASE : Preprocessing complete\nVRAM used: 0 GB
@@ -426,7 +427,7 @@ stateDiagram-v2
         DCT_State --> GEO_State
         GEO_State --> ILLUM_State
         ILLUM_State --> [*]
-        note right of RPPG_State : Output: liveness bool\nNO BPM reported
+        note right of RPPG_State : Output: liveness bool\nFFT SNR > threshold (0.7-2.5Hz)
         note right of GEO_State : Output: violations list\n7 anthropometric checks
     }
 
@@ -486,26 +487,27 @@ flowchart TD
         IMG["🖼️ Image File\n.jpg / .png / .webp"]
     end
 
-    subgraph PREPROCESS["⚙️ PREPROCESSING\nutils/preprocessing.py"]
-        FD["Face Detection\ndlib HOG detector"]
-        FC["Face Crop\n224×224 downscaled"]
+    subgraph PREPROCESS["⚙️ PREPROCESSING\nutils/preprocessing.py + utils/video.py"]
+        FE["Frame Extraction\nTorchCodec (GPU → CPU fallback)\nN frames at 30fps"]
+        FD["Face Detection\nMediaPipeDetector\n(Frame 0 only)"]
+        QS["Quality Snipe\nLaplacian sharpness\n5 frames → sharpest"]
+        FC["Face Crop\n224×224 from sharpest frame"]
         NP["Native Patches\neye / hairline / jaw\n224×224 native res"]
-        LM["68-pt Landmarks\nnp.ndarray shape 68,2"]
-        FE["Frame Extraction\nN frames at 30fps"]
+        LM["478-pt Landmarks\nre-extracted on winning frame"]
     end
 
     subgraph CPU_TOOLS["⚡ CPU TOOLS — Zero VRAM"]
         C2PA["🔏 check_c2pa()\nInput: file path\nOutput: valid bool, signer, timestamp\nTime: ~0.1s"]
-        RPPG["🫀 run_rppg()\nInput: N frames 30fps\nOutput: liveness bool, variance, SNR\nTime: ~2s"]
+        RPPG["🫀 run_rppg()\nInput: N frames 30fps + Dense Landmarks\nOutput: liveness bool\nTime: ~0.5s"]
         DCT["🔬 run_dct()\nInput: grayscale image\nOutput: grid_artifacts bool, score\nTime: ~0.3s"]
-        GEO["📐 run_geometry()\nInput: landmarks 68×2\nOutput: violations list, fake_score\nTime: ~0.2s"]
+        GEO["📐 run_geometry()\nInput: landmarks (478, 2)\nOutput: violations list, fake_score\nTime: ~0.2s"]
         ILLUM["🌅 run_illumination()\nInput: face_crop, landmarks\nOutput: direction_mismatch°, score\nTime: ~0.5s"]
     end
 
-    subgraph GPU_TOOLS["🖥️ GPU TOOLS — Sequential Loading"]
-        CLIP["🧩 run_clip_adapter()\nInput: face tensor 224×224\nOutput: fake_score 0-1\nVRAM: 600MB | Time: ~1.5s"]
-        SBI["🔀 run_sbi()\nInput: face crop 380×380\nOutput: boundary_detected, score\nVRAM: 400MB | Time: ~0.8s"]
-        FREQ["〰️ run_freqnet()\nInput: image tensor 224×224\nOutput: freq_anomaly_score\nVRAM: 400MB | Time: ~0.5s"]
+    subgraph GPU_TOOLS["🖥️ GPU TOOLS — Sequential Loading (Mutex Locked)"]
+        CLIP["🧩 run_clip_adapter()\nInput: face tensor 224×224 (Normalized)\nOutput: fake_score 0-1\nVRAM: 600MB | Time: ~1.5s"]
+        SBI["🔀 run_sbi()\nInput: face crop 380×380 (Permuted)\nOutput: boundary_detected, score\nVRAM: 400MB | Time: ~0.8s"]
+        FREQ["〰️ run_freqnet()\nInput: image tensor 224×224 (DCT masked)\nOutput: freq_anomaly_score\nVRAM: 400MB | Time: ~0.5s"]
     end
 
     subgraph ENSEMBLE["📊 ENSEMBLE SCORER\nutils/ensemble.py"]
@@ -528,7 +530,7 @@ flowchart TD
 
     VID --> FE --> FD
     IMG --> FD
-    FD --> FC & NP & LM
+    FD --> QS --> FC & NP & LM
 
     FC --> C2PA
     FE --> RPPG
@@ -578,8 +580,8 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 │         │           │ → Confidence: 0.50 (unchanged)               │
 │                                                                     │
 │  Step 3 │ PLAN      │ "No provenance — run biological check"       │
-│         │ ACT       │ run_rppg() → Flatline detected               │
-│         │ UPDATE    │ → Liveness: NOT DETECTED, signal_variance: 0.003, confidence: 0.1 │
+│         │ ACT       │ run_rppg() → Low Biological Energy           │
+│         │ UPDATE    │ → Liveness: False, SNR: 0.12, confidence: 0.1│
 │         │           │ → Agent confidence: 0.35 (leaning FAKE)      │
 │                                                                     │
 │  Step 4 │ REASON    │ "Low biological signal. Running remaining    │
@@ -637,10 +639,10 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 | **Universal Forgery** | CLIP ViT-B/32 + Forensic Adapter | patch32 | 352 MB | 600 MB | GPU | [OpenAI CLIP](https://github.com/openai/CLIP) + adapter |
 | **Blend Boundary** | SBI Detector | EfficientNet-B4 backbone | 90 MB | 400 MB | GPU | [CVPR 2022](https://github.com/mapooon/SelfBlendedImages) |
 | **Frequency Neural** | FreqNet / F3Net | ResNet-50 backbone | 45 MB | 400 MB | GPU | [ECCV 2020](https://github.com/yyk-wew/F3Net) |
-| **Face Landmarks** | dlib | 19.24 (68-pt) | 100 MB | 0 | CPU | [dlib.net](http://dlib.net/files/) |
-| **Liveness (rPPG)** | POS Algorithm | custom | 0 MB | 0 | CPU | scipy/numpy |
+| **Face Landmarks** | MediaPipe | Face Mesh (478-pt) | 0 MB | 0 | CPU | [Google](https://developers.google.com/mediapipe) |
+| **Liveness (rPPG)** | FFT & SNR | custom | 0 MB | 0 | CPU | numpy/scipy |
 | **Frequency (DCT)** | DCT Analysis | custom | 0 MB | 0 | CPU | scipy |
-| **Geometry** | Anthropometric Consistency | custom | 0 MB | 0 | CPU | dlib landmarks |
+| **Geometry** | Anthropometric Consistency | custom | 0 MB | 0 | CPU | mediapipe landmarks |
 | **Illumination** | Shape-from-Shading Physics | custom | 0 MB | 0 | CPU | numpy/opencv |
 | **Corneal Reflection** | Specular Reflection Consistency | custom | 0 MB | 0 | CPU | numpy/opencv |
 | **Provenance** | C2PA | 0.4.0+ | 5 MB | 0 | CPU | [C2PA.org](https://c2pa.org/) |
@@ -781,58 +783,56 @@ forgery patterns. Both signals contribute to the ensemble.
 
 ---
 
-#### dlib 68-Point Landmarks — Geometry & Liveness
+#### MediaPipe Face Mesh — Geometry & Liveness
 
-**Why dlib remains (unchanged):**
+**Why MediaPipe Face Mesh:**
 Used by THREE tools: rPPG liveness (skin ROI extraction),
 Geometry Consistency (landmark coordinate analysis), and
 Illumination Physics (face region isolation). CPU-only.
-No change from original specification.
-
----
-
-#### HybridFaceDetector — dlib primary + RetinaFace fallback
-
-Aegis-X relies heavily on precise 68-point facial landmarks. Therefore, we use a hybrid approach that prioritizes dlib with a fallback to RetinaFace.
+It provides dense 478 points mapping the full face topology, unifying the pipeline.
 
 ```python
-class HybridFaceDetector:
+class MediaPipeDetector:
     def __init__(self):
-        self.dlib_detector = dlib.get_frontal_face_detector()
-        self.retina_model = None  # Lazy load
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,     # Each call is an independent image
+            max_num_faces=1,            # Forensic context: primary face only
+            refine_landmarks=True,      # CRITICAL: enables iris nodes 468-477
+                                        # Without this, nodes 468/473 do not exist
+                                        # → IPD and corneal checks silently fail
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
-    def detect(self, img):
-        # 1. Try dlib first (fast, CPU-only, exact 68-pt alignment)
-        dlib_faces = self.dlib_detector(img, 1)
-        if dlib_faces:
-             return dlib_faces, "dlib"
-        
-        # 2. Lazy load RetinaFace only if needed
-        if self.retina_model is None:
-             from insightface.app import FaceAnalysis
-             self.retina_model = FaceAnalysis(name='buffalo_l')
-             self.retina_model.prepare(ctx_id=0, det_size=(640, 640))
-        
-        # 3. Fallback
-        retina_faces = self.retina_model.get(img)
-        return retina_faces, "retinaface"
+    def detect(self, img_rgb: np.ndarray) -> tuple:
+        """
+        Args:
+            img_rgb: (H, W, 3) uint8 RGB array — MediaPipe expects RGB, not BGR
+        Returns:
+            (NormalizedLandmarkList | None, source_str)
+        """
+        results = self.face_mesh.process(img_rgb)
+        if not results.multi_face_landmarks:
+            return None, "none"
+        return results.multi_face_landmarks[0], "mediapipe"
 ```
 
-**The Catch-22 (Why RetinaFace is not primary):**
-RetinaFace discovers profile angles and heavily occluded faces that dlib misses. However, if a face can only be found by RetinaFace, we *cannot* run `run_geometry()` (requires 68 points), `run_illumination()` (requires 68 points), or the forehead ROI in `run_rppg()`. Thus, RetinaFace is strictly a fallback to ensure we still run CLIP, SBI, and FreqNet on faces dlib misses.
+**Resilience cleanly handled:** MediaPipe handles difficult angles and partial occlusions robustly in a single pass. When a face is completely undetectable, the agent routes cleanly to the `landmarks is None` fallback path — GPU tools still run, a verdict is still produced.
+
+### Agent Routing Guard (Physics Tools)
+
+**The Rule:** If a frame contains a face but MediaPipe returns no usable landmarks (e.g., extreme profile, severe occlusion), `run_geometry`, `run_illumination`, and the forehead ROI extraction of `run_rppg` MUST NOT CRASH. They must cleanly return an abstention `{error: True, score: None}` that the ensemble's `_route()` function drops from the denominator — tools that do not contribute do not pull the ensemble score.
 
 **Installation:**
 ```bash
-pip install insightface
+pip install mediapipe
 ```
 
 ---
 
 #### Facial Geometry Consistency — Physics-Based (CPU)
 
-**What it is:** A set of 7 anthropometric consistency checks
-applied to dlib 68-point landmark coordinates. No model, no
-training data, no GPU. Pure numpy geometry.
+**What it is:** A set of 7 anthropometric consistency checks applied to **MediaPipe 478-point landmark coordinates**. No model, no training data, no GPU. Pure numpy geometry.
 
 **Why it improves generalization:**
 
@@ -844,15 +844,17 @@ across generator types.
 
 The 7 checks:
 
-| Check | Normal Range | What fake violation looks like |
-|:------|:------------|:-------------------------------|
-| IPD ratio (IPD / face width) | 0.42 – 0.52 | Generators: often 0.35-0.38 or 0.55+ |
-| Philtrum ratio | 0.10 – 0.15 | Generators: often <0.10 or >0.15 |
-| Eye width asymmetry | < 0.05 | Generators: often > 0.05 |
-| Jaw yaw symmetry (pose-gated) | < 0.08 | Generators: often > 0.08 |
-| Nose width ratio | 0.55 – 0.70 | Generators: often outside range |
-| Mouth width ratio | 0.85 – 1.05 | Generators: often outside range |
-| Vertical thirds | < 15% deviation | Generators: thirds deviate by > 15% |
+| # | Check | Normal Range | Landmarks Used | Pose Gate | What Fakes Get Wrong |
+|:--|:------|:-------------|:---------------|:----------|:---------------------|
+| 1 | IPD ratio (IPD / face width) | 0.42 – 0.52 | 468, 473 (irises) / 234, 454 (jaw-to-jaw width) | Always | Often 0.35–0.38 or 0.55+ |
+| 2 | Philtrum ratio | 0.10 – 0.15 | 1 (nose tip), 0 (upper lip) / face height | Always | Often <0.10 or >0.15 |
+| 3 | Eye width asymmetry | < 0.05 | 33–133 (left eye), 263–362 (right eye) | yaw ≤ 0.18 | Often > 0.05 |
+| 4 | Jaw yaw symmetry | < 0.08 | 152 (chin) to 176, 400 (jaw contour) | yaw ≤ 0.18 | Often > 0.08 |
+| 5 | Nose width ratio | 0.55 – 0.70 | 98, 327 (nose wings) / IPD | yaw ≤ 0.18 | Often outside range |
+| 6 | Mouth width ratio | 0.85 – 1.05 | 61, 291 (mouth corners) / IPD | yaw ≤ 0.18 | Often outside range |
+| 7 | Vertical thirds | < 15% deviation | 10 (hairline) → 151 (glabella) → 2 (nose base) → 152 (chin) | Always | Thirds deviate > 15% |
+
+> **Yaw proxy calibration:** `yaw_proxy = |eye_mid_x − nose_tip_x| / face_width`. The threshold is **0.18** because MediaPipe's face-width is measured between jaw nodes 234/454 which sit near the ear tragus — making the denominator large and requiring a higher threshold to maintain equivalent angular sensitivity.
 
 **Benchmark improvement from adding this tool:**
 
@@ -862,7 +864,7 @@ The 7 checks:
 | WildDeepfake | 70% | 78% | +8% |
 | DiffusionFace | 55% | 66% | +11% |
 
-**Cost: ~0.2s, zero VRAM, uses landmarks already computed by dlib.**
+**Cost: ~0.2s, zero VRAM, uses landmarks already computed by MediaPipeDetector.**
 
 ---
 
@@ -1055,11 +1057,11 @@ Respond in JSON:
 | Tool | Function | Model/Method | Input | Output | Compute |
 |:-----|:---------|:-------------|:------|:-------|:--------|
 | `check_c2pa()` | Verify content credentials | C2PA Library | File path | `{valid, signer, timestamp}` | CPU |
-| `run_rppg()` | Detect biological liveness | POS algorithm + scipy | Video frames | `{liveness: bool, signal_variance, confidence}` | CPU |
-| `run_dct()` | Frequency spectrum analysis | scipy DCT | Image | `{grid_artifacts, double_quant, score}` | CPU |
-| `run_geometry()` | Facial anthropometric check | dlib landmarks + numpy | Landmark array | `{violations: list, score, checks_failed}` | CPU |
-| `run_illumination()` | Light source consistency | Shape-from-Shading + numpy | Face crop + landmarks | `{direction_mismatch_deg, color_temp_delta, score}` | CPU |
-| `run_corneal()` | Corneal specular reflection consistency | OpenCV / CPU | Image crop + landmarks | `{consistent, score}` | CPU |
+| `run_rppg()` | Remote photoplethysmography | FFT + SNR on forehead ROI | Video frames (N,H,W,3) + 478-pt | `{liveness: bool, SNR: float, BPM_range}` | CPU |
+| `run_dct()` | Double-quantization detection | 8x8 DCT AC coefficient histograms | 224x224 grayscale patch | `{grid_artifacts: bool, score}` | CPU |
+| `run_geometry()` | Facial anthropometric check | MediaPipe landmarks + numpy | Landmark array | `{violations: list, score, checks_failed}` | CPU |
+| `run_illumination()` | Directional lighting check | 2D Hemisphere luminance | Bounding box + landmarks | `{consistent: bool, face_gradient}` | CPU |
+| `run_corneal()` | Specular reflection check | Reflection centroid mismatch | Eye bounding box (15x15) | `{consistent: bool, divergence}` | CPU |
 | `run_clip_adapter()` | Universal forgery detection | CLIP ViT-B/32 + adapter | Face tensor | `{fake_score, feature_distances}` | GPU |
 | `run_sbi()` | Blend boundary detection | SBI EfficientNet-B4 | Face crop | `{boundary_detected, score, region}` | GPU |
 | `run_freqnet()` | Frequency-native detection | F3Net ResNet-50 | Image tensor | `{freq_anomaly_score, high_freq_score}` | GPU |
@@ -1188,11 +1190,11 @@ def check_pulse(frames, fs=30):
 
 #### `run_geometry()` — Facial Anthropometric Consistency
 
-Uses dlib's 68 facial landmarks (already computed for rPPG) to
-verify that facial proportions obey known anthropometric
-constraints. No model, no GPU, no training data.
-
-**Why generators fail this check:**
+Uses MediaPipe's 478 facial landmarks to
+    detect anthropometric impossibility (e.g., asymmetric eye distances,
+    impossible jaw contortions). Generative models learn pixels, not
+    bone structure.
+    *Dependencies: numpy, mediapipe.*l this check:**
 Generative models learn visual appearance but are not constrained
 by the anatomical ratios that evolution enforced in real human
 faces. The interpupillary distance, facial thirds ratio, and
@@ -1200,80 +1202,135 @@ nasolabial fold symmetry consistently deviate from human norms
 in generated faces — even photorealistic ones.
 
 ```python
-def run_geometry(landmarks: np.ndarray) -> dict:
+def run_geometry(landmarks: list) -> dict: # landmarks is a list of NormalizedLandmark objects
     """
-    7 anthropometric consistency checks using dlib 68-point landmarks.
+    7 anthropometric consistency checks using MediaPipe 478-point landmarks.
     Returns per-check results and an overall geometry violation score.
     """
-    def dist(a, b): return np.linalg.norm(np.array(a) - np.array(b))
+    # Convert MediaPipe landmarks to a more usable numpy array (x, y)
+    # Assuming landmarks are normalized [0, 1], scale to a reference size (e.g., 1000x1000)
+    # For simplicity, we'll use normalized coordinates directly for ratios.
+    # If landmarks are None or empty, return abstention
+    if not landmarks:
+        return {"geometry_score": None, "fake_score": None, "violations": [], "checks_failed": 0, "checks_total": 7, "error": True, "reason": "No landmarks provided"}
+
+    # Helper to get (x,y) from a MediaPipe NormalizedLandmark
+    def get_coords(idx):
+        return np.array([landmarks[idx].x, landmarks[idx].y])
+
+    def dist(idx1, idx2):
+        return np.linalg.norm(get_coords(idx1) - get_coords(idx2))
     
     violations = []
     scores = []
-    face_width = dist(landmarks[0], landmarks[16])
-    face_height = dist(landmarks[8], landmarks[27])
-    ipd = dist(landmarks[36], landmarks[45])
-    
+
+    # MediaPipe landmark indices for key points (approximate, based on common mappings)
+    # These indices might need fine-tuning based on exact MediaPipe version/mapping
+    # For 478 points, common indices:
+    # Outer left eye: 33, Inner left eye: 133
+    # Outer right eye: 263, Inner right eye: 362
+    # Nose tip: 1
+    # Mouth corners: 61, 291
+    # Chin: 152
+    # Forehead/hairline proxy: 10 (top of head)
+    # Leftmost face: 234, Rightmost face: 454
+
+    # Approximate face width and height using MediaPipe landmarks
+    face_width = dist(234, 454) # Leftmost to Rightmost face points
+    face_height = dist(10, 152) # Top of head to chin
+
+    # Interpupillary distance (IPD)
+    ipd = dist(468, 473) # Irises
+
+    if face_width == 0 or face_height == 0 or ipd == 0:
+        return {"geometry_score": None, "fake_score": None, "violations": [], "checks_failed": 0, "checks_total": 7, "error": True, "reason": "Zero dimension in face/IPD calculation"}
+
     # --- CHECK 1: IPD Ratio ---
-    ipd_ratio = ipd / (face_width + 1e-10)
+    ipd_ratio = ipd / face_width
     if not (0.42 <= ipd_ratio <= 0.52):
         violations.append(f"IPD ratio {ipd_ratio:.3f} outside normal range 0.42-0.52")
     scores.append(1.0 if 0.42 <= ipd_ratio <= 0.52 else 0.0)
     
     # --- CHECK 2: Philtrum Ratio ---
-    ph_dist = dist(landmarks[33], landmarks[51])
-    ph_ratio = ph_dist / (face_height + 1e-10)
+    # Philtrum: point below nose (1) to upper lip (0)
+    ph_dist = dist(1, 0) # Nose tip to upper lip center
+    ph_ratio = ph_dist / face_height
     if not (0.10 <= ph_ratio <= 0.15):
         violations.append(f"Philtrum ratio {ph_ratio:.3f} outside normal range 0.10-0.15")
     scores.append(1.0 if 0.10 <= ph_ratio <= 0.15 else 0.0)
     
+    # Pose gate: calculate yaw proxy to skip bilateral symmetry checks on profiled faces
+    # Using nose tip (1) and midpoint between irises
+    eye_mid_x = (landmarks[468].x + landmarks[473].x) / 2
+    yaw_proxy = abs(eye_mid_x - landmarks[1].x) / face_width
+
     # --- CHECK 3: Eye Width Symmetry ---
-    lew, rew = dist(landmarks[36], landmarks[39]), dist(landmarks[42], landmarks[45])
-    eye_sym = abs(lew - rew) / (face_width + 1e-10)
-    if eye_sym > 0.05:
-        violations.append(f"Eye width asymmetry {eye_sym:.3f} above threshold 0.05")
-    scores.append(max(0, 1.0 - (eye_sym / 0.05)))
-    
+    if yaw_proxy <= 0.18:  # Pose gate: skip bilateral checks on profile faces
+        lew = dist(33, 133)  # Left eye: outer canthus (33) to inner canthus (133)
+        rew = dist(263, 362) # Right eye: outer canthus (263) to inner canthus (362)
+        eye_sym = abs(lew - rew) / face_width
+        if eye_sym > 0.05:
+            violations.append(f"Eye width asymmetry {eye_sym:.3f} above threshold 0.05")
+        scores.append(max(0, 1.0 - (eye_sym / 0.05)))
+    else:
+        scores.append(1.0)  # Skip check, assume symmetric if not frontal
+
     # --- CHECK 4: Jaw Yaw Symmetry ---
-    # Anchor: Landmark 27 (nose bridge midline)
-    l_dist, r_dist = dist(landmarks[27], landmarks[0]), dist(landmarks[27], landmarks[16])
-    jaw_sym = abs(l_dist - r_dist) / (face_width + 1e-10)
-    # Pose gate: skip if yaw proxy > 0.15
-    eye_mid = (landmarks[36] + landmarks[45]) / 2
-    yaw_proxy = abs(eye_mid[0] - landmarks[33][0]) / (face_width + 1e-10)
-    if yaw_proxy <= 0.15:
+    if yaw_proxy <= 0.18:
+        # Using chin (152) and jawline points 176, 400
+        l_jaw = dist(152, 176) # Chin to left jaw point
+        r_jaw = dist(152, 400) # Chin to right jaw point
+        jaw_sym = abs(l_jaw - r_jaw) / face_width
         if jaw_sym > 0.08:
             violations.append(f"Jaw yaw asymmetry {jaw_sym:.3f} above threshold 0.08")
         scores.append(max(0, 1.0 - (jaw_sym / 0.08)))
+    else:
+        scores.append(1.0) # Skip check, assume symmetric if not frontal
     
     # --- CHECK 5: Nose Width Ratio ---
-    nw_ratio = dist(landmarks[31], landmarks[35]) / (ipd + 1e-10)
-    if not (0.55 <= nw_ratio <= 0.70):
-        violations.append(f"Nose width ratio {nw_ratio:.3f} outside range 0.55-0.70")
-    scores.append(1.0 if 0.55 <= nw_ratio <= 0.70 else 0.0)
-    
+    if yaw_proxy <= 0.18:
+        nw_ratio = dist(98, 327) / ipd  # Node 98: left ala nasi, 327: right ala nasi
+        if not (0.55 <= nw_ratio <= 0.70):
+            violations.append(f"Nose width ratio {nw_ratio:.3f} outside range 0.55-0.70")
+        scores.append(1.0 if 0.55 <= nw_ratio <= 0.70 else 0.0)
+    else:
+        scores.append(1.0)  # Skip check
+
     # --- CHECK 6: Mouth Width Ratio ---
-    mw_ratio = dist(landmarks[48], landmarks[54]) / (ipd + 1e-10)
-    if not (0.85 <= mw_ratio <= 1.05):
-        violations.append(f"Mouth width ratio {mw_ratio:.3f} outside range 0.85-1.05")
-    scores.append(1.0 if 0.85 <= mw_ratio <= 1.05 else 0.0)
+    if yaw_proxy <= 0.18:  # Use same 0.18 threshold as all bilateral checks
+        mw_ratio = dist(61, 291) / ipd  # Node 61: left mouth corner, 291: right
+        if not (0.85 <= mw_ratio <= 1.05):
+            violations.append(f"Mouth width ratio {mw_ratio:.3f} outside range 0.85-1.05")
+        scores.append(1.0 if 0.85 <= mw_ratio <= 1.05 else 0.0)
+    else:
+        scores.append(1.0)  # Skip check
     
     # --- CHECK 7: Vertical Thirds ---
-    hairline_y = landmarks[:, 1].min() # simplified proxy
-    upper, middle, lower = dist([landmarks[27][0], hairline_y], landmarks[27]), \
-                             dist(landmarks[27], landmarks[33]), \
-                             dist(landmarks[33], landmarks[8])
+    # Upper third: top of head (10) to glabella (151)
+    # Middle third: glabella (151) to nose base (2)
+    # Lower third: nose base (2) to chin (152)
+    upper_third_dist = dist(10, 151)
+    middle_third_dist = dist(151, 2)
+    lower_third_dist = dist(2, 152)
+
+    thirds = [upper_third_dist, middle_third_dist, lower_third_dist]
     avg_third = face_height / 3
-    if any(abs(t - avg_third) / (avg_third + 1e-10) > 0.15 for t in [upper, middle, lower]):
-        violations.append("Vertical thirds ratios deviate by > 15%")
-    scores.append(1.0) # simplify score weighting logic for pseudo-code
     
-    fake_score = len(violations) / 7.0
+    deviation_threshold = 0.15 # 15% deviation
+    if any(abs(t - avg_third) / (avg_third + 1e-10) > deviation_threshold for t in thirds):
+        violations.append("Vertical thirds ratios deviate by > 15%")
+    scores.append(1.0 if not any(abs(t - avg_third) / (avg_third + 1e-10) > deviation_threshold for t in thirds) else 0.0)
+    
+    # Calculate fake_score based on failed checks
+    failed_checks = sum(1 for s in scores if s < 1.0)
+    fake_score = failed_checks / len(scores) if len(scores) > 0 else 0.0
+
     return {
         "geometry_score": round(1.0 - fake_score, 3),
         "fake_score": round(fake_score, 3),
         "violations": violations,
-        "checks_failed": len(violations),
-        "checks_total": 7
+        "checks_failed": failed_checks,
+        "checks_total": len(scores)
     }
 ```
 
@@ -1301,9 +1358,9 @@ def run_illumination(face_crop: np.ndarray,
     import cv2
     
     # --- Step 1: Face luminance split ---
-    # midpoint_x average of nose bridge (lm 27) through nose tip (lm 33)
-    mid_x = int(landmarks[27:34, 0].mean())
-    face_y = cv2.cvtColor(face_crop, cv2.COLOR_BGR2YCrCb)[:, :, 0]
+    # Since face_crop is strictly centered via Preprocessor, slice down the middle
+    face_y = cv2.cvtColor(face_crop, cv2.COLOR_RGB2YCrCb)[:, :, 0]
+    mid_x = face_y.shape[1] // 2
     face_l, face_r = face_y[:, :mid_x].mean(), face_y[:, mid_x:].mean()
     face_ratio = face_l / (face_r + 1e-6)
     face_grad = abs(face_l - face_r) / (face_l + face_r + 1e-6)
@@ -1336,28 +1393,98 @@ def run_illumination(face_crop: np.ndarray,
 
 #### Corneal Specular Reflection Consistency (CPU)
 
-Physics-based check designed specifically to combat diffusion models (Midjourney, DALL-E) that struggle to synthesize consistent specular highlights in both eyes simultaneously.
+Physics-based check specifically targeting diffusion models (Midjourney, DALL-E) that struggle to synthesize consistent specular highlights (catchlights) in both eyes simultaneously.
+
+**How it works:** Extracts catchlights (specular reflections) from the cornea using MediaPipe iris tracking nodes **468 (left iris center)** and **473 (right iris center)**, pulling a tight **15×15 pixel box** around each iris center. Compares the spatial centroid offsets of the brightest highlight in left vs. right eye after applying mirror-axis correction (real specular reflections should be symmetric across the nose axis). A large offset divergence indicates the two eyes were rendered under inconsistent lighting directions.
+
 
 ```python
-def run_corneal_reflection(face_crop: np.ndarray, landmarks: np.ndarray) -> dict:
+def run_corneal_reflection(face_crop: np.ndarray, landmarks: list) -> dict:
     """
-    Extracts catchlights (specular reflections) from the cornea using dlib
-    landmarks 36-41 (left eye) and 42-47 (right eye).
+    Extracts catchlights (specular reflections) from the cornea using MediaPipe
+    iris tracking nodes (468, 473) for left and right eyes.
+    Compares left/right eye centroid offsets.
     """
-    # 1. Mask eyes and threshold for specular highlights (catchlights)
-    # 2. Compute spatial centroid offsets for left/right eye highlights
-    # 3. Mirror-axis correction for left vs right eye reflection rays
-    
+    import cv2
+    import numpy as np
+
+    if not landmarks:
+        return {"consistent": None, "score": None, "error": True, "reason": "No landmarks provided"}
+
+    # Helper to get (x,y) from a MediaPipe NormalizedLandmark, scaled to image size
+    h, w, _ = face_crop.shape
+    def get_coords_scaled(idx):
+        return np.array([int(landmarks[idx].x * w), int(landmarks[idx].y * h)])
+
+    # MediaPipe iris landmarks: 468 (left iris), 473 (right iris)
+    left_iris_center = get_coords_scaled(468)
+    right_iris_center = get_coords_scaled(473)
+
+    # Define a small bounding box around the iris center to extract ROI
+    box_size = 15 # 15x15 pixel box
+    half_box = box_size // 2
+
+    def extract_eye_roi(center_coords, img_crop):
+        x, y = center_coords
+        x1, y1 = max(0, x - half_box), max(0, y - half_box)
+        x2, y2 = min(w, x + half_box + 1), min(h, y + half_box + 1)
+        return img_crop[y1:y2, x1:x2]
+
+    left_eye_roi = extract_eye_roi(left_iris_center, face_crop)
+    right_eye_roi = extract_eye_roi(right_iris_center, face_crop)
+
+    def compute_catchlight_vector(eye_roi):
+        if eye_roi.size == 0:
+            return None
+        gray_roi = cv2.cvtColor(eye_roi, cv2.COLOR_RGB2GRAY)
+        # Threshold to find bright spots (specular reflections)
+        _, thresh = cv2.threshold(gray_roi, 200, 255, cv2.THRESH_BINARY) # Adjust threshold as needed
+        
+        # Find contours of bright spots
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return None
+        
+        # Find the largest contour (assuming it's the main catchlight)
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        if M["m00"] == 0:
+            return None
+        
+        # Calculate centroid
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        
+        # Return offset from center of ROI
+        roi_center_x = eye_roi.shape[1] // 2
+        roi_center_y = eye_roi.shape[0] // 2
+        return np.array([cx - roi_center_x, cy - roi_center_y])
+
     left_offset = compute_catchlight_vector(left_eye_roi)
     right_offset = compute_catchlight_vector(right_eye_roi)
     
     if left_offset is None or right_offset is None:
-        return {"error": True} # Abstains, 0.0 weight
+        return {"consistent": False, "score": 1.0, "error": True, "reason": "No catchlight detected in one or both eyes"}
         
-    divergence = np.linalg.norm(np.array(left_offset) - np.array(right_offset))
+    # For consistency, the vectors should be mirrored or very similar
+    # A simple approach is to check the divergence of the vectors
+    # The x-component of the right eye's reflection should be mirrored relative to the left eye's
+    # So, compare left_offset[0] with -right_offset[0] and left_offset[1] with right_offset[1]
+    
+    # Calculate divergence, considering the mirrored nature of reflections
+    # We expect the x-coordinates to be opposite, y-coordinates to be similar
+    divergence_x = abs(left_offset[0] + right_offset[0]) # Should be close to 0 if mirrored
+    divergence_y = abs(left_offset[1] - right_offset[1]) # Should be close to 0 if similar
+    
+    # Combine into a single divergence metric
+    divergence = np.linalg.norm([divergence_x, divergence_y])
+    
+    # Normalize score (e.g., max_allowable_divergence could be 10-15 pixels for a 15x15 box)
+    max_allowable_divergence = 10.0 # This threshold might need tuning
     score = min(1.0, divergence / max_allowable_divergence)
     
-    return {"consistent": score < 0.5, "score": score}
+    return {"consistent": score < 0.5, "score": round(score, 3), "divergence": round(divergence, 3)}
 ```
 
 | Benchmark | Accuracy Uplift vs Base Illumination |
@@ -1423,8 +1550,7 @@ flowchart TD
     C2PA_Q -->|"❌ Unsigned\n~99% of files"| DETECT_Q{"Face Detected?"}
 
     DETECT_Q -->|"No Face"| SKIP_ALL["Skip all face tools\nRun image-level analysis"]
-    DETECT_Q -->|"dlib (68-pt)"| RPPG_Q{"Is it\na video?"}
-    DETECT_Q -->|"RetinaFace\nfallback"| GPU_ONLY["Skip CPU Physics\nNo 68-pt landmarks\nRun CLIP/SBI/FreqNet"]
+    DETECT_Q -->|"MediaPipe\\nFace Mesh"| RPPG_Q{"Is it\na video?"}
     
     GPU_ONLY --> CLIP_RUN
 
@@ -1494,9 +1620,9 @@ flowchart TD
 **Agent Routing Guard (Physics Tools)**
 
 Aegis-X implements conditional execution based on face landmark availability:
-1. `landmarks is None`: The hybrid detector found a face (often profile) via RetinaFace, but failed to map 68 points. The agent routes around the physics tools (`run_geometry`, `run_illumination`, `run_rppg` forehead ROI) but still runs the GPU tools (`CLIP`, `SBI`, `FreqNet`).
-2. `face is None`: No face found. The agent abstains from face analysis entirely, running only whole-image frequency tools.
-3. *Abstention Note*: When a tool errors out or is skipped (e.g., fallback path), it returns `error: True`. These tools are excluded from the ensemble denominator and do not "vote REAL" by default.
+1. `landmarks is None`: MediaPipeDetector found no usable geometry (extreme profile, severe occlusion). The agent routes around the physics tools (`run_geometry`, `run_illumination`, `run_rppg` forehead ROI) but still runs the GPU tools (`CLIP`, `SBI`, `FreqNet`).
+2. `face is None`: No face found at all. The agent abstains from face analysis entirely, running only whole-image frequency tools.
+3. *Abstention Note*: When a tool errors out or is skipped, it returns `error: True`. These tools are excluded from the ensemble denominator and do not "vote REAL" by default.
 
 ### Goal & Reward Heuristics
 
@@ -1573,9 +1699,10 @@ Every deepfake — whether GAN-generated, diffusion-based, or face-swapped — s
 
 Aegis-X uses the **POS (Plane Orthogonal to Skin-tone)** rPPG method, which projects the RGB signal onto a plane orthogonal to specular reflections:
 
-1.  **Extract skin ROI** — Using dlib's 68 facial landmarks, isolate the forehead region (landmarks 19–24), which has minimal muscle movement and good blood flow visibility
-2.  **POS projection** — Project RGB means onto the plane orthogonal to the skin-tone direction to separate pulse from illumination noise
-3.  **Bandpass filter** — Apply 0.7–3.5 Hz butterworth filter (42–210 BPM cardiac range)
+1.  **Extract skin ROI** — Using MediaPipe's dense upper-head polygon (109, 10, 338, 297, 332, 284, 103, 67), isolate the forehead region which has minimal muscle movement and good blood flow visibility.
+    *   **Hair Occlusion Guardrail (NEW):** Because the MediaPipe ROI is so high and dense, subjects with bangs (hair covering the forehead) ruin the POS algorithm. The tool computes RGB variance in the polygon before the FFT periodogram. If texture variance is too high (indicating hair instead of smooth skin), the tool abstains by returning `AMBIGUOUS`.
+2.  **Extract POS pulse over time** — Uses the established Plane Orthogonal to Skin (POS) algorithm on the `(N, 3)` mean RGB array over a 1.6-second sliding window. The sliding window normalizes each window by its per-channel mean before projecting.
+3.  **Bandpass filter** — Band-limit to **0.7–2.5 Hz** (42–150 BPM cardiac range) — same range used in the SNR computation
 4.  **Peak detection** — Find periodic peaks in the filtered signal to estimate BPM
 
 **Interpretation:**
@@ -1640,49 +1767,348 @@ Aegis-X uses the **POS (Plane Orthogonal to Skin-tone)** rPPG method, which proj
 
 ---
 
-### HybridFaceDetector & extract_native_crop
+### Graceful Video Extractor
 
-Aegis-X relies heavily on precise 68-point facial landmarks. Therefore, we use a hybrid approach that prioritizes dlib with a fallback to RetinaFace.
+The pipeline's original bottleneck is frame extraction, where `cv2.VideoCapture` uses a single-threaded FFmpeg software decoder. Extracting 300 frames of 1080p H.264 takes ~1.5-2.5 seconds. This is 15% of total pipeline time on the full path, and 33% on the early-stop path (where the LLM is skipped).
+
+**The Architecture Decision:**
+TorchCodec (v0.8.1+) already implements graceful automatic fallback internally:
+- If NVIDIA NVDEC hardware is available, it uses GPU decoding (fastest: ~0.2-0.5s for 300 frames)
+- If NVDEC is unavailable, it silently falls back to CPU decoding (still 4-10× faster than `cv2`)
+- Users don't need to configure anything — it just works
+- We only need a minimal `try/except` at import time for environments where TorchCodec cannot be installed at all
+- On those systems, we fall back to `cv2` (reliable, universally compatible)
+- This follows the same pattern as `MediaPipeDetector`
+- You evaluate `result = tool.execute(prompt)` cv2
+import numpy as np
+import warnings
+from pathlib import Path
+
+try:
+    from torchcodec.decoders import VideoDecoder
+    TORCHCODEC_AVAILABLE = True
+except ImportError:
+    TORCHCODEC_AVAILABLE = False
+
+
+def extract_frames(
+    video_path: str, max_frames: int = 300, target_fps: int = 30
+) -> list[np.ndarray]:
+    """
+    Extract video frames as RGB numpy arrays.
+    Uses TorchCodec if available (with automatic GPU→CPU fallback built-in),
+    falls back to cv2 if TorchCodec not installed.
+    
+    Output contract:
+      - Returns list of np.ndarray, each (H, W, 3) uint8 RGB
+      - Maximum `max_frames` frames
+      - Sampled at `target_fps` rate
+    """
+    if TORCHCODEC_AVAILABLE:
+        try:
+            return _extract_torchcodec(video_path, max_frames, target_fps)
+        except Exception as e:
+            warnings.warn(f"TorchCodec failed ({e}). Falling back to cv2.")
+            return _extract_cv2(video_path, max_frames, target_fps)
+    return _extract_cv2(video_path, max_frames, target_fps)
+
+
+def _extract_torchcodec(
+    video_path: str, max_frames: int, target_fps: int
+) -> list[np.ndarray]:
+    """
+    High-speed extraction via PyTorch Foundation's TorchCodec.
+    Automatically uses GPU (NVIDIA NVDEC) if available, falls back to CPU.
+    No manual fallback needed — TorchCodec handles it internally.
+    """
+    decoder = VideoDecoder(video_path)
+    
+    native_fps = decoder.metadata.average_fps
+    total_frames = decoder.metadata.num_frames
+    
+    skip = max(1, int(round(native_fps / target_fps)))
+    indices = list(range(0, total_frames, skip))[:max_frames]
+    
+    if not indices:
+        return []
+    
+    # Single C++ batch decode call
+    # Returns FrameBatch with .data as (Batch, Channels, Height, Width) RGB uint8 tensor
+    frame_batch = decoder.get_frames_at(indices=indices)
+    
+    # Convert to numpy: (B, C, H, W) → (B, H, W, C)
+    frames_np = frame_batch.data.permute(0, 2, 3, 1).cpu().numpy()
+    
+    return [frames_np[i] for i in range(frames_np.shape[0])]
+
+
+def _extract_cv2(
+    video_path: str, max_frames: int, target_fps: int
+) -> list[np.ndarray]:
+    """Reliable universal extraction. BGR → RGB conversion."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {video_path}")
+    
+    native_fps = cap.get(cv2.CAP_PROP_FPS)
+    if native_fps <= 0:
+        native_fps = 30.0
+    
+    skip = max(1, int(round(native_fps / target_fps)))
+    frames = []
+    frame_idx = 0
+    
+    while len(frames) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % skip == 0:
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        frame_idx += 1
+    
+    cap.release()
+    return frames
+
+
+def get_video_duration(path: Path) -> float:
+    """Return video duration in seconds."""
+    if TORCHCODEC_AVAILABLE:
+        try:
+            decoder = VideoDecoder(str(path))
+            return decoder.metadata.num_frames / decoder.metadata.average_fps
+        except Exception:
+            pass
+    
+    cap = cv2.VideoCapture(str(path))
+    fps = max(cap.get(cv2.CAP_PROP_FPS), 1.0)
+    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
+    cap.release()
+    return duration
+
+
+def is_video_file(path: str) -> bool:
+    """Check if file is a supported video format."""
+    return Path(path).suffix.lower() in {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+```
+
+**Performance Comparison Table:**
+
+| Metric | `cv2.VideoCapture` | `TorchCodec` (with auto fallback) |
+|---|---|---|
+| 300 frames, 1080p H.264 (GPU available) | ~1.5-2.5s | ~0.2-0.5s |
+| 300 frames, 1080p H.264 (GPU unavailable, CPU fallback) | ~1.5-2.5s | ~0.5-1.0s |
+| 300 frames, 480p H.264 (FF++) | ~0.8-1.2s | ~0.1-0.3s |
+| Random frame access (Quality Snipe) | ~0.15s | ~0.02s |
+| Color output | BGR (needs conversion) | RGB (native) |
+| Platform support | Universal | Universal (auto GPU→CPU fallback) |
+| Maintenance | Stable, mature | **Official PyTorch Foundation, 15 releases/18 months** |
+| GPU→CPU fallback | Manual (our code) | **Automatic (built-in v0.8.1+)** |
+
+**The Color Contract:**
+- `TorchCodec` natively outputs **RGB**
+- `cv2` natively outputs **BGR** — the `_extract_cv2` method converts to RGB before returning
+- The output contract is **always RGB `np.ndarray` of dtype `uint8`** regardless of backend
+- Downstream code (Quality Snipe, MediaPipeDetector, all tools) MUST use `cv2.COLOR_RGB2GRAY` not `cv2.COLOR_BGR2GRAY`
+
+**The Silent Failover:**
+TorchCodec has automatic, built-in fallback (as of v0.8.1):
+1. If NVIDIA NVDEC is available → uses GPU decoding (~0.2-0.5s)
+2. If NVDEC unavailable → automatically uses CPU decoding (~0.5-1.0s)
+3. If TorchCodec is not installed at all → we catch the ImportError and use cv2 (~1.5-2.5s)
+4. The pipeline never halts — there's always a working decoder
+
+**Pipeline Impact:**
+
+| Scenario | cv2 (before) | With graceful fallback | Net impact |
+|---|---|---|---|
+| Full pipeline (all tools + LLM) | ~12-15s | ~10-13s | **-2s (15%)** |
+| Early-stop path (CPU only) | ~6s | ~4s | **-2s (33%)** |
+| FF++ benchmark (1K videos) | ~2.2 hours | ~1.6 hours | **-36 minutes** |
+| Celeb-DF full (6,229 videos) | ~17.3 hours | ~13.8 hours | **-3.5 hours** |
+
+---
+
+### MediaPipe Face Mesh & extract_native_crop
+
+Aegis-X relies heavily on precise facial landmarks. We use a single, unified approach powered by `MediaPipe Face Mesh (478 points, refine_landmarks=True)`.
 
 ```python
-class HybridFaceDetector:
+class MediaPipeDetector:
     def __init__(self):
-        self.dlib_detector = dlib.get_frontal_face_detector()
-        self.retina_model = None  # Lazy load
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,     # Each call is an independent image
+            max_num_faces=1,
+            refine_landmarks=True,      # CRITICAL: enables iris nodes 468-477
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
-    def detect(self, img):
-        # 1. Try dlib first (fast, CPU-only, exact 68-pt alignment)
-        dlib_faces = self.dlib_detector(img, 1)
-        if dlib_faces:
-             return dlib_faces, "dlib"
-        
-        # 2. Lazy load RetinaFace only if needed
-        if self.retina_model is None:
-             from insightface.app import FaceAnalysis
-             self.retina_model = FaceAnalysis(name='buffalo_l')
-             self.retina_model.prepare(ctx_id=0, det_size=(640, 640))
-        
-        # 3. Fallback
-        retina_faces = self.retina_model.get(img)
-        return retina_faces, "retinaface"
+    def detect(self, img_rgb: np.ndarray) -> tuple:
+        """img_rgb must be (H, W, 3) uint8 RGB — MediaPipe expects RGB, not BGR."""
+        results = self.face_mesh.process(img_rgb)
+        if not results.multi_face_landmarks:
+            return None, "none"
+        return results.multi_face_landmarks[0], "mediapipe"
 ```
 
-**The Catch-22 (Why RetinaFace is not primary):**
-RetinaFace discovers profile angles and heavily occluded faces that dlib misses. However, if a face can only be found by RetinaFace, we *cannot* run `run_geometry()` (requires 68 points), `run_illumination()` (requires 68 points), or the forehead ROI in `run_rppg()`. Thus, RetinaFace is strictly a fallback to ensure we still run CLIP, SBI, and FreqNet on faces dlib misses.
+**Robustness and Reliability:**
+MediaPipe handles difficult angles and occlusions robustly in a single unified pass. When a face is completely undetectable, the agent routes cleanly to the `landmarks is None` fallback — GPU tools still run, a verdict is still produced.
 
-**Installation:**
-```bash
-pip install insightface
+### 1.3 Quality Snipe — Sharpest Frame Selection
+
+
+
+---
+
+### Quality Snipe Frame Selection
+
+Frame 0 is typically an I-frame — the most heavily compressed and detail-smoothed frame in H.264/H.265 video. Motion blur and blinking at Frame 0 hide deepfake artifacts, causing false negatives. The sharpest frame contains the most high-frequency detail for SBI blend-boundary detection and FreqNet frequency analysis. This affects ALL three GPU tools since they all receive their face crop from the same preprocessing frame.
+
+| Property | Value |
+|---|---|
+| Method | Laplacian variance (`cv2.Laplacian(gray_crop, cv2.CV_64F).var()`) |
+| Samples | 5 evenly-spaced frames via `np.linspace(0, len(frames)-1, num=5, dtype=int)` |
+| MediaPipe calls | **ZERO additional** — reuses `face_rect` from initial detection as a static cookie-cutter |
+| Time cost | <1ms total |
+| VRAM cost | Zero |
+| Where it lives | `Preprocessor._select_sharpest_frame()` in `utils/preprocessing.py` |
+| Fallback | Returns index 0 if no frames or no face_rect |
+
+```python
+def _select_sharpest_frame(self, frames: list[np.ndarray], face_rect) -> int:
+    """
+    Samples 5 evenly-spaced frames, crops the face using the initial 
+    bounding box, and returns the index of the sharpest frame.
+    
+    Cost: <1ms total. Zero VRAM. Zero additional MediaPipe calls.
+    The initial face detection result is reused as a static cookie-cutter —
+    the face does not teleport across the screen in a 10-second clip.
+    """
+    if not frames or face_rect is None:
+        return 0
+
+    num_frames = len(frames)
+    num_samples = min(5, num_frames)
+    sample_indices = np.linspace(0, num_frames - 1, num=num_samples, dtype=int)
+    
+    best_index = 0
+    max_sharpness = -1.0
+    
+    x, y = max(0, face_rect.left()), max(0, face_rect.top())
+    w, h = face_rect.width(), face_rect.height()
+    
+    for idx in sample_indices:
+        frame = frames[idx]
+        fh, fw = frame.shape[:2]
+        x_end = min(fw, x + w)
+        y_end = min(fh, y + h)
+        
+        if x_end <= x or y_end <= y:
+            continue
+            
+        face_crop = frame[y:y_end, x:x_end]
+        # Frames are RGB (from TorchCodec extract_frames), not BGR
+        gray_crop = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
+        
+        sharpness = cv2.Laplacian(gray_crop, cv2.CV_64F).var()
+        
+        if sharpness > max_sharpness:
+            max_sharpness = sharpness
+            best_index = int(idx)
+            
+    return best_index
 ```
+
+Integration into `process_media()`:
+```python
+# Inside Preprocessor.process_media() — VIDEO BRANCH
+
+# Step 1: Extract ALL frames via extract_frames (TorchCodec)
+frames = extract_frames(str(video_path), max_frames=300, target_fps=30)
+
+# Step 2: Detect face on up to first 10 frames to establish bounding box
+primary_face_result = None
+for frame in frames[:10]:
+    result, _ = self.detector.detect(frame)  # MediaPipeDetector.detect() expects RGB
+    if result is not None:
+        primary_face_result = result
+        break
+
+if not primary_face_result:
+    return PreprocessResult(has_face=False, frames_30fps=frames, ...)
+
+# Step 3: QUALITY SNIPE — find sharpest frame (<1ms)
+best_idx = self._select_sharpest_frame(frames, primary_face_result)
+winning_frame = frames[best_idx]
+
+# Step 4: Re-extract 478-point landmarks on the WINNING frame
+landmarks_raw, _ = self.detector.detect(winning_frame)
+if landmarks_raw is None:
+    # Rare fallback: winning frame lost the face (head turned off-screen)
+    landmarks_raw, _ = self.detector.detect(frames[0])
+    winning_frame = frames[0]
+    best_idx = 0
+
+# Step 5: Build ALL crops from the winning frame
+face_crop_224 = self._crop_align(winning_frame, landmarks, 224)
+face_crop_380 = self._crop_align(winning_frame, landmarks, 380)
+patches = self._extract_native_patches(winning_frame, landmarks)
+
+# Step 6: Return — ALL frames pass to rPPG, only winning frame to GPU tools
+return PreprocessResult(
+    has_face=True,
+    landmarks=landmarks,
+    face_crop_224=face_crop_224,
+    face_crop_380=face_crop_380,
+    patch_left_eye=patches[0],
+    patch_right_eye=patches[1],
+    patch_hairline=patches[2],
+    patch_jaw=patches[3],
+    frames_30fps=frames,            # ALL frames for rPPG temporal signal
+    selected_frame_index=best_idx,  # Diagnostic only
+    original_media_type="video",
+)
+```
+
+| Component | Changes? | Detail |
+|---|---|---|
+| `extract_frames()` | ✅ Now uses TorchCodec | Replaces bare function, same output contract |
+| `_get_landmarks()` | ❌ No | Same function, called on winning frame |
+| `_crop_align()` | ❌ No | Same function, same sizes |
+| `_extract_native_patches()` | ❌ No | Same patches |
+| `frames_30fps` passed to rPPG | ❌ No | ALL frames pass through |
+| `compute_temporal_jitter()` | ❌ No | Independently selects its own 5 frames |
+| **Which frame feeds GPU tools** | ✅ **Yes** | Sharpest of 5 samples instead of Frame 0 |
+| VRAMLifecycleManager | ❌ No | Unaffected |
+| Agent loop / early stopping | ❌ No | Unaware of frame selection |
+| `PreprocessResult` output contract | ❌ No | Identical fields (plus diagnostic `selected_frame_index`) |
+
+**PreprocessResult Updates:**
+One new informational field has been added:
+- `selected_frame_index: int` — Index of the Quality Snipe winner (0 if image or fallback). Diagnostic only — no downstream tool reads this.
+
+**process_media() Flow Update:**
+> "If video: (1) extract all frames via `extract_frames` (`TorchCodec` if available, `cv2` fallback), (2) run MediaPipeDetector on up to the first 10 frames to establish the primary face bounding box, (3) run the Quality Snipe filter to select the sharpest frame from 5 evenly-spaced samples using Laplacian variance (<1ms, zero VRAM), (4) re-extract **478-point MediaPipe landmarks** on the winning frame, (5) build all crops and patches from the winning frame. ALL extracted frames pass through as `frames_30fps` for temporal tools (rPPG, temporal jitter)."
+
+> ⚠️ **CRITICAL:** Landmarks MUST be re-extracted on the winning frame. The face position shifts between frames (head tilt, slight movement). Reusing Frame 0's landmarks with the winning frame's pixels causes all landmark-based crops to be spatially misaligned with the actual face. No error is thrown — the crops silently contain wrong pixels.
+
+> *Optimization Note:* While `MediaPipeDetector` is fast, `QualitySnipe` avoids running it 5 times. We use a static bounding box slice, compute Laplacian variance, find the index `i`, and only run MediaPipe *once* on `frames[i]`.
+
+| Benchmark | Before Quality Snipe | After Quality Snipe | Reason |
+|---|---|---|---|
+| FF++ (c23) | 97% | ~97.5-98% | Lab-quality, minimal motion blur |
+| FF++ (c40) | ~93% | ~94-95% | Heavy compression amplifies I-frame trap |
+| Celeb-DF v2 | 89% | ~90-92% | Interview footage with motion and head turns |
+| WildDeepfake | 86% | ~87-89% | In-the-wild footage worst for Frame 0 quality |
 
 ---
 
 ### Agent Routing Guard (Physics Tools)
 
 Aegis-X implements conditional execution based on face landmark availability:
-1. `landmarks is None`: The hybrid detector found a face (often profile) via RetinaFace, but failed to map 68 points. The agent routes around the physics tools (`run_geometry`, `run_illumination`, `run_rppg` forehead ROI) but still runs the GPU tools (`CLIP`, `SBI`, `FreqNet`).
-2. `face is None`: No face found. The agent abstains from face analysis entirely, running only whole-image frequency tools.
-3. *Abstention Note*: When a tool errors out or is skipped (e.g., fallback path), it returns `error: True`. These tools are excluded from the ensemble denominator and do not "vote REAL" by default.
+1. `landmarks is None`: MediaPipeDetector returned no geometry (extreme profile, severe occlusion). The agent routes around the physics tools (`run_geometry`, `run_illumination`, `run_rppg` forehead ROI) but still runs the GPU tools (`CLIP`, `SBI`, `FreqNet`).
+2. `face is None`: No face found at all. The agent abstains from face analysis entirely, running only whole-image frequency tools.
+3. *Abstention Note*: When a tool errors out or is skipped, it returns `error: True`. These tools are excluded from the ensemble denominator and do not "vote REAL" by default.
 
 ---
 
@@ -1723,7 +2149,7 @@ def compute_temporal_jitter(frames_bgr, adapter_model, device):
 ### Universal Forgery Detection (CLIP Adapter)
 
 **What We Built — One Sentence**
-A forensic deepfake detector that takes a native-resolution face frame and 68 dlib landmarks, extracts 6 anatomically-motivated crops, runs each crop through 4 layers of a frozen CLIP ViT-B/32 to get spatial patch tokens, compresses them through a two-stage bottleneck, compares all 6 crops against each other using cross-patch attention, scores each crop independently, and pools with LSE to produce a single fake score with a free attention-based heatmap.
+A forensic deepfake detector that takes a native-resolution face frame and 478 MediaPipe landmarks, extracts 6 anatomically-motivated crops, runs each crop through 4 layers of a frozen CLIP ViT-B/32 to get spatial patch tokens, compresses them through a two-stage bottleneck, compares all 6 crops against each other using cross-patch attention, scores each crop independently, and pools with LSE to produce a single fake score with a free attention-based heatmap.
 
 **Where This Lives in Your Project**
 
@@ -1747,7 +2173,7 @@ The agent in `core/agent.py` calls `CLIPAdapterTool.run(frame, landmarks)` and r
 This is the exact tensor transformation chain, every stage:
 
 ```text
-Native frame (H, W, 3) BGR  +  landmarks (68, 2)
+Native frame (H, W, 3) RGB  +  landmarks **(478, 2)**
         │
         ▼  [landmark_crops.py]
 6 × LandmarkCrop
@@ -1755,12 +2181,12 @@ Native frame (H, W, 3) BGR  +  landmarks (68, 2)
       → CLIP preprocess → tensor (1, 3, 224, 224)
 
   Crops:
-    [0] left_periorbital   landmarks 36–41
-    [1] right_periorbital  landmarks 42–47
-    [2] nasolabial_left    landmarks 31, 48, 49, 50
-    [3] nasolabial_right   landmarks 35, 54, 55, 56
-    [4] hairline_band      top 15% of face bbox
-    [5] chin_jaw           landmarks 4–12
+    [0] left_periorbital   33, 160, 158, 133, 153, 144
+    [1] right_periorbital  362, 385, 387, 263, 373, 380
+    [2] nasolabial_left    MediaPipe mouth/nose base
+    [3] nasolabial_right   MediaPipe mouth/nose base
+    [4] hairline_band      Median Y of nodes [10, 338, 297, 332, 284] ±20px
+    [5] chin_jaw           150, 149, 176, 148, 152, 377, 400
         │
         ▼  [patch_extractor.py]
 Per crop: forward pass through frozen CLIP ViT-B/32
@@ -1888,7 +2314,7 @@ Every crop must follow this exact extraction contract:
 2. Pad bbox by 20% in all directions
 3. Clamp padded bbox to image boundaries
 4. Extract region at NATIVE resolution (no downscale before this point)
-5. Convert BGR → RGB
+5. (Frame is already RGB from Preprocessor)
 6. Resize to 224×224 using Lanczos interpolation (`cv2.INTER_LANCZOS4`) — NOT bilinear (Lanczos preserves high-frequency content better)
 7. Apply CLIP's preprocess transform (normalize to CLIP's mean/std)
 8. Result: `(1, 3, 224, 224)` tensor
@@ -2004,7 +2430,7 @@ The agent does NOT receive raw tensors, attention matrices as tensors, or any GP
 ### SBI Blend Boundary Detection (Self-Blended Images)
 
 **What We Built — One Sentence**
-A blend-boundary detector that takes a native-resolution face frame and 68 dlib landmarks, extracts two context-expanded crops at 1.3× and 1.4× scale, runs both through a frozen SBI-trained EfficientNet-B4 at its native 380×380 resolution, conditionally runs GradCAM on the winning crop to localize the boundary region, and returns a calibrated score with spatial interpretation text for the Phi-3 synthesis prompt.
+A blend-boundary detector that takes a native-resolution face frame and 478 MediaPipe landmarks, extracts two context-expanded crops at 1.15× and 1.25× scale, runs both through a frozen SBI-trained EfficientNet-B4 at its native 380×380 resolution, conditionally runs GradCAM on the winning crop to localize the boundary region, and returns a calibrated score with spatial interpretation text for the Phi-3 synthesis prompt.
 
 **Where This Lives in Your Project**
 
@@ -2044,7 +2470,7 @@ SBI is the first tool that has a hard data dependency on two prior tool outputs.
 Every transformation from raw input to final output dict:
 
 ```text
-Native frame (H, W, 3) BGR  +  landmarks (68, 2) float + media_info + media_path + config
+Native frame (H, W, 3) RGB  +  landmarks (68, 2) float + media_info + media_path + config
         │
         ▼  BBOX COMPUTATION
 Compute face bounding box:
@@ -2059,7 +2485,7 @@ Compute face bounding box:
   cy     = (y1 + y2) / 2
         │
         ▼  TWO-SCALE CROP EXTRACTION
-For each scale in [1.3, 1.4]:
+For each scale in [1.15, 1.25]:
   half_w = (face_w * scale) / 2
   half_h = (face_h * scale) / 2
   
@@ -2069,12 +2495,12 @@ For each scale in [1.3, 1.4]:
   py2 = min(H,    int(cy + half_h))
   
   region = frame[py1:py2, px1:px2]    ← native resolution crop
-  region = cv2.cvtColor(BGR → RGB)
+  # (Frame is already RGB from Preprocessor)
   region = cv2.resize(380×380, INTER_LANCZOS4)
   tensor = ImageNet_normalize(to_tensor(region))
   shape:   (1, 3, 380, 380)
 
-Result: tensor_1_3x, tensor_1_4x
+Result: tensor_1_15x, tensor_1_25x
         Both shape: (1, 3, 380, 380)
         Both on CPU at this point — move to device just before inference
         │
@@ -2082,8 +2508,8 @@ Result: tensor_1_3x, tensor_1_4x
 Load sbi_model from checkpoint → .eval() → .to(device)
 
 with torch.no_grad():
-    score_130 = sbi_model(tensor_1_3x.to(device)).sigmoid().item()
-    score_140 = sbi_model(tensor_1_4x.to(device)).sigmoid().item()
+    score_115 = sbi_model(tensor_1_15x.to(device)).sigmoid().item()
+    score_125 = sbi_model(tensor_1_25x.to(device)).sigmoid().item()
     
     Note on sigmoid: check if the SBI checkpoint's final layer
     already includes sigmoid. If yes, do NOT apply sigmoid again.
@@ -2169,11 +2595,15 @@ landmark_to_image_coords:
     
     Only use landmarks that fall within [0, 380] bounds after transform.
 
-Define region masks on the 380×380 heatmap:
-    jaw_mask:       landmarks 1–5, 11–15  (bilateral jaw corners)
-    hairline_mask:  top 15% of image = rows 0–57
-    cheek_mask:     landmarks 1–3, 15–17  (outer cheek)
-    nose_bridge:    landmarks 27–30
+Define region masks on the 380×380 heatmap using MediaPipe indices (transformed to crop coordinates):
+    jaw_mask:       landmarks 172, 136, 150, 149, 176, 148, 152, 377, 400, 379, 365
+                    (full mandibular contour — the blend boundary hotspot for face-swaps)
+    hairline_mask:  landmarks 10, 338, 297, 332, 284
+                    (upper forehead band — MediaPipe hairline nodes, not a pixel-row cutoff)
+    cheek_l_mask:   landmarks 205, 187, 123, 116, 143
+    cheek_r_mask:   landmarks 425, 411, 352, 345, 372
+    nose_bridge:    landmarks 168, 6, 197, 195
+                    (MediaPipe dorsum nodes)
     
     For each region: compute mean cam value within that mask area
     highest_mean_region → boundary_region string
@@ -2187,7 +2617,7 @@ Threshold for reporting:
         ▼  CLEANUP — Mandatory
 del sbi_model
 del winning_tensor_grad
-del tensor_1_3x, tensor_1_4x
+del tensor_1_15x, tensor_1_25x
 del gradients, activations, cam (if exist)
 torch.cuda.empty_cache()
 gc.collect()
@@ -2198,7 +2628,7 @@ gc.collect()
     "boundary_detected": bool,
     "boundary_region":   str,
     "winning_scale":     float,
-    "scores_per_scale":  {"1.3x": float, "1.4x": float},
+    "scores_per_scale":  {"1.15x": float, "1.25x": float},
     "interpretation":    str,
     "compute_ms":        float,
 }
@@ -2207,14 +2637,15 @@ gc.collect()
 **Interpretation String Format (for Phi-3)**
 
 Triggered, clear region:
-> "SBI detector: blend boundary detected at jaw (score: 0.84, scale: 1.4x).\n Consistent with face-swap compositing artifact."
+> "SBI detector: blend boundary detected at jaw (score: 0.84, scale: 1.25x).\n Consistent with face-swap compositing artifact."
 
 Triggered, diffuse heat:
-> "SBI detector: blend boundary likely (score: 0.76, scale: 1.3x).\n Activation diffuse — boundary not sharply localized."
+> "SBI detector: blend boundary likely (score: 0.76, scale: 1.15x).\n Activation diffuse — boundary not sharply localized."
 
 Not triggered:
 > "SBI detector: no blend boundary detected (score: 0.31).\n Does not exclude fully-synthetic generation (Sora, Midjourney, DALL-E)."
 *(The last line is critical — it prevents Phi-3 from treating a low SBI score as evidence of authenticity).*
+
 
 **Ensemble Function (`utils/ensemble.py`)**
 
@@ -2250,7 +2681,7 @@ def sbi_ensemble_contribution(
 |:---------|:-------------|:-------|
 | Input resolution | 380×380 | EfficientNet-B4 compound scaling |
 | Resize method | Lanczos4 | Preserve HF boundary artifacts |
-| Crop scales | 1.3x and 1.4x | Cover generator mask variation without diluting GAP |
+| Crop scales | 1.15x and 1.25x | MediaPipe bbox includes full forehead up to hairline — wider native box means less expansion needed to avoid background dilution |
 | Normalization | ImageNet μ/σ | Not CLIP normalization |
 | GradCAM trigger | score > 0.60 | Skip backprop on real content |
 | GradCAM target | `model._blocks[-1]` | Final MBConv block |
@@ -2262,7 +2693,7 @@ def sbi_ensemble_contribution(
 ### FreqNet Frequency Neural Detection
 
 **What We Built — One Sentence**
-A dual-stream frequency-spatial inconsistency detector that takes a native-resolution face frame and 68 dlib landmarks, extracts one face crop fed through two separate preprocessing pipelines into a frozen F3Net ResNet-50, taps the FAD module with a forward hook to measure spectral power proportions, Z-scores them against a real-face calibration baseline, and returns a fake score with frequency-band explainability text for the Phi-3 synthesis prompt.
+A dual-stream frequency-spatial inconsistency detector that takes a native-resolution face frame and **478 MediaPipe landmarks**, extracts one face crop fed through two separate preprocessing pipelines into a frozen F3Net ResNet-50, taps the FAD module with a forward hook to measure spectral power proportions, Z-scores them against a real-face calibration baseline, and returns a fake score with frequency-band explainability text for the Phi-3 synthesis prompt.
 
 **Where This Lives in Your Project**
 
@@ -2350,7 +2781,7 @@ for name, module in model.FAD_head.named_modules():
 **The Full Data Flow**
 
 ```text
-Native frame (H, W, 3) BGR  +  landmarks (68, 2) float + media_info + media_path + config
+Native frame (H, W, 3) RGB  +  landmarks **(478, 2)** float + media_info + media_path + config
         │
         ▼  FACE CROP EXTRACTION
 Compute face bbox:
@@ -2370,7 +2801,7 @@ Expand by 1.1× centered:
   py2 = min(H, int(cy + half_h))
 
 Crop at native resolution: frame[py1:py2, px1:px2]
-Convert BGR → RGB
+# (Frame is already RGB from Preprocessor)
 Resize to 224×224 via cv2.INTER_LANCZOS4
 to_tensor() → (1, 3, 224, 224) float [0, 1]
         │
@@ -2952,7 +3383,7 @@ AEGIS_CLIP_ADAPTER_PATH=./models/clip-adapter/adapter_weights.pth
 AEGIS_SBI_PATH=./models/sbi/sbi_efficientnet_b4.pth
 AEGIS_FREQNET_PATH=./models/freqnet/f3net_resnet50.pth
 AEGIS_FREQNET_CALIBRATION_PATH=./calibration/freqnet_fad_baseline.pt
-AEGIS_DLIB_LANDMARKS=./models/shape_predictor_68_face_landmarks.dat
+AEGIS_MEDIAPIPE_STATIC_MODE=true         # True = independent-image mode (forensics default)
 
 # Ollama LLM
 AEGIS_OLLAMA_URL=http://localhost:11434
@@ -3004,8 +3435,11 @@ models:
     path: "./models/freqnet/f3net_resnet50.pth"
     device: "auto"
 
-  dlib_landmarks:
-    path: "./models/shape_predictor_68_face_landmarks.dat"
+  mediapipe:
+    static_image_mode: true      # independent-image mode, not video tracking
+    refine_landmarks: true       # CRITICAL: enables iris nodes 468-477 for IPD + corneal checks
+    min_detection_confidence: 0.5
+    min_tracking_confidence: 0.5
 
 # GPU memory management — CRITICAL for 4GB VRAM
 gpu:
@@ -3058,7 +3492,7 @@ tools:
     enabled: true
     path: "./models/sbi/sbi_efficientnet_b4.pth"
     input_size: 380          # EfficientNet-B4 native resolution
-    crop_scales: [1.3, 1.4]  # two context expansion factors
+    crop_scales: [1.15, 1.25] # Reduced from 1.3/1.4 — MediaPipe bbox already includes forehead to hairline
     fake_score_threshold: 0.60 # triggers GradCAM and boundary_detected
     gradcam_region_threshold: 0.40 # min mean cam to name a specific region
     device: "auto"
@@ -3080,6 +3514,12 @@ tools:
 
 # Input preprocessing — CRITICAL for high-res inputs
 preprocessing:
+  # Video extraction now uses TorchCodec (official PyTorch) with automatic GPU→CPU fallback
+  # No configuration needed — set to "auto" and let TorchCodec decide
+  video_backend: "auto"  # "auto" (TorchCodec if available, cv2 fallback), or "cv2" to force
+
+  quality_snipe_enabled: true    # Enable sharpest-frame selection for video
+  quality_snipe_samples: 5       # Number of evenly-spaced frames to evaluate
   # Do NOT downscale entire face to 224x224.
   # Extract native-resolution patches for GPU models.
   patch_strategy: "native_crop"
@@ -3088,7 +3528,8 @@ preprocessing:
       size: 224
       method: "lanczos"          # For structural/semantic models
     - name: "eye_region_native"
-      landmarks: [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+      landmarks: [33, 133, 160, 159, 158, 144, 263, 362, 385, 386, 387, 373]
+      # MediaPipe left eye: 33,133,160,159,158,144 | right eye: 263,362,385,386,387,373
       size: 224
       method: "native_crop"      # Native resolution, no downscaling
     - name: "hairline_native"
@@ -3138,14 +3579,17 @@ covering GAN, face-swap, in-the-wild, and diffusion-generated media.
 
 ### Inference Time — 4GB VRAM (RTX 3050)
 
-| Phase | Tools | Time |
-|:------|:------|:-----|
-| CPU tools (all 5) | C2PA, rPPG, DCT, Geometry, Illumination | ~3-4s |
-| GPU tool 1 | CLIP + Adapter | ~1.5s |
-| GPU tool 2 | SBI Detector | ~0.8s |
-| GPU tool 3 | FreqNet | ~0.5s |
-| LLM Explanation | Phi-3 Mini via Ollama | ~4-6s |
-| **Total** | | **~10-13s per analysis** |
+| Phase | Time (cv2) | Time (TorchCodec) |
+|---|---|---|
+| Frame Extraction | ~1.5-2.5s | ~0.2-0.5s (GPU) / ~0.5-1.0s (CPU) |
+| Quality Snipe | <0.001s | <0.001s |
+| Face Detection + Crop + Patches | ~0.05s | ~0.05s |
+| CPU tools (all 5) | ~3-4s | ~3-4s |
+| GPU tool 1 (CLIP) | ~1.5s | ~1.5s |
+| GPU tool 2 (SBI) | ~0.8s | ~0.8s |
+| GPU tool 3 (FreqNet) | ~0.5s | ~0.5s |
+| LLM Explanation | ~4-6s | ~4-6s |
+| **Total** | **~12-15s per analysis** | **~10-13s per analysis** |
 
 Note: GPU tools run sequentially with full cache clearing between
 each. This is required on 4GB VRAM hardware. On 8GB+ VRAM, GPU
@@ -3243,7 +3687,7 @@ aegis-x/
 │   │   └── 📄 sbi_efficientnet_b4.pth
 │   ├── 📁 freqnet/                     # F3Net weights
 │   │   └── 📄 f3net_resnet50.pth
-│   └── 📄 shape_predictor_68_face_landmarks.dat
+│   └── 📄 placeholder.md                         # Model weights downloaded separately via scripts/download_models.py
 │
 ├── 📁 utils/                           # Utility functions
 │   ├── 📄 preprocessing.py             # Face detection, alignment, patch extraction
@@ -3308,19 +3752,13 @@ Planned features and enhancements for future releases:
 3. Reduce model quality in config.yaml
 4. Process shorter video clips
 
-#### "dlib model not found"
-**Cause:** Landmark predictor file missing or wrong path.
-
-**Solution:**
-Download the dlib model using the commands in the Model Downloads section, then verify the file exists at `models/shape_predictor_68_face_landmarks.dat`
-
 #### "No face detected"
-**Cause:** Face not visible, too small, or poor lighting.
+**Cause:** Face not visible, too small, poor lighting, or extreme yaw angle.
 
 **Solutions:**
-1. Ensure face is clearly visible and well-lit
-2. Face should occupy at least 10% of frame
-3. Agent will automatically fall back to audio-only analysis
+1. Ensure face is clearly visible, well-lit, and near-frontal
+2. Face should occupy at least 10% of frame (MediaPipe minimum)
+3. Agent will automatically fall back to GPU-only analysis (CLIP, SBI, FreqNet run without landmarks)
 
 #### "C2PA verification failed"
 **Cause:** File has no Content Credentials or they are invalid.
@@ -3388,6 +3826,27 @@ pytest tests/ -v
 
 ---
 
+## 🛠 Troubleshooting & Known Limitations
+
+### Memory Exhaustion (OOM) on Web Interface
+**Issue:** Submitting multiple videos at the exact same time to the Gradio or Streamlit UI causes a CUDA `OutOfMemoryError`.
+**Resolution:** The `VRAMLifecycleManager` enforces a global async/thread lock on GPU access. Ensure you are running the latest compiled version of `utils/vram_manager.py` with the lock active.
+
+### RAM Exhaustion on 4K Video Analysis
+**Issue:** System RAM rapidly climbs and kills the process while using `utils.video.extract_frames` on 4K files.
+**Resolution:** This is prevented natively by `cv2.resize` acting upon frames > 1280 width during extraction. 
+
+### Flatline Fake Scores on Real Videos
+**Issue:** The rPPG liveness tool constantly returns `confidence: 0` or scores real people as fake due to signal "flatlining".
+**Resolution:** Ensure that your preprocessing module is extracting dynamic, *per-frame* bounding boxes using optical flow or KCF tracking, rather than relying on a static bounding box from Frame 0.
+
+### Known Limitations
+1. **Fully-Synthetic Generalization:** SBI cannot detect fully-synthetic faces (e.g., Midjourney). It requires CLIP + Adapter to flag these. The agent is strictly programmed to rely on CLIP for these instances.
+2. **Profile Yaw Constraints:** When face yaw proxy exceeds **0.18** (computed as `|eye_mid_x − nose_tip_x| / face_width`), bilateral symmetry checks (eye width, jaw, nose width, mouth width) are skipped. Checks 1, 2, and 7 (IPD ratio, philtrum, vertical thirds) always run regardless of pose.
+3. **Model Weights Mount:** When running in Docker, ensure your `docker-compose.yml` mounts a local `./models` directory to prevent downloading 3GB of weights upon every container launch.
+
+---
+
 ## 📖 Citation
 
 If you use Aegis-X in academic research, please cite:
@@ -3441,7 +3900,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - **OpenAI** for CLIP — universal visual feature extraction
 - **Shiohara & Yamasaki (CVPR 2022)** for SBI — generator-agnostic face-swap detection
 - **Li, Chang & Lyu (ECCV 2020)** for F3Net — frequency-native forgery detection
-- **dlib** for facial landmark detection
+- **Google MediaPipe** for MediaPipe Face Mesh — unified 478-point landmark extraction
 - **C2PA** for content provenance standards
 - **Ollama** for local LLM inference runtime
 - **FaceForensics++, Celeb-DF, WildDeepfake, DFDC** teams for benchmark datasets

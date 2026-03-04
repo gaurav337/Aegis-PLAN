@@ -35,8 +35,8 @@ You need to move beyond simple object detection to "Pixel Forensics."
 * *Resource:* Read the [AIMv2: Autoregressive Image Models](https://arxiv.org/abs/2401.08541) research paper (it's the foundation for the tool).
 
 
-* **Facial Landmarks:** Mastering **dlib** or **MediaPipe** is essential for tracking eyes and skin.
-* *Resource:* [PyImageSearch - Facial Landmarks with dlib and Python](https://pyimagesearch.com/2017/04/03/facial-landmarks-dlib-opencv-python/).
+* **Facial Landmarks:** Mastering **MediaPipe** is essential for tracking eyes and skin.
+* *Resource:* [MediaPipe Face Landmarker Implementation Guide](https://developers.google.com/mediapipe/solutions/vision/face_landmarker/python).
 
 
 
@@ -73,7 +73,7 @@ Finally, you must learn **C2PA**—the industry standard for "Content Credential
 
 To keep from getting overwhelmed, build in this order:
 
-1. **Level 1:** A simple Python script using `dlib` to detect a face and `EfficientNet` to give a "Real/Fake" score.
+1. **Level 1:** A simple Python script using `MediaPipe` to detect a face and `EfficientNet` to give a "Real/Fake" score.
 2. **Level 2:** Add an LLM (using Ollama or HuggingFace) that takes that score and "explains" it.
 3. **Level 3:** Add the Tool Registry. Create a `c2pa_tool.py` and an `entropy_tool.py`.
 4. **Level 4 (Aegis-X):** Implement the **Agent Loop** where the LLM decides *which* tool to run based on the video quality.
