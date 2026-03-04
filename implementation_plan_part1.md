@@ -5,7 +5,7 @@
 |---|---|---|---|
 | 0 | Project Scaffolding & Configuration | 1–2 | Repository structure, config.py, custom exceptions, logger setup, ToolResult dataclass, abstract base tool |
 | 1 | Utilities & Preprocessing Pipeline | 3–5 | image.py, video.py, preprocessing.py (dlib face/landmark extraction), vram_manager.py |
-| 2 | CPU Forensic Tools | 6–10 | tools/c2pa_tool.py, rppg_tool.py, dct_tool.py, geometry_tool.py, illumination_tool.py |
+| 2 | CPU Forensic Tools | 6–10 | tools/c2pa_tool.py, rppg_tool.py, dct_tool.py, geometry_tool.py, illumination_tool.py, corneal_tool.py |
 | 3 | GPU Forensic Tools | 11–14 | tools/clip_adapter_tool.py, sbi_tool.py, freqnet_tool.py, tool_registry.py |
 | 4 | Ensemble, Early Stopping & Memory | 15–17 | utils/ensemble.py, core/early_stopping.py, core/memory.py |
 | 5 | LLM Integration & Agent Brain | 18–22 | utils/ollama_client.py, core/prompts/forensic_summary.py, core/agent.py |
@@ -27,13 +27,14 @@ This is Phase 0, Day 1: Project Scaffolding & Configuration. Nothing exists yet.
 **Section B: Today's Objectives**
 - Create `requirements.txt` to define pinned dependencies.
 - Create `.env.example` as a template for environment variables.
+- Create `utils/thresholds.py` as the single source of truth for all numeric constants.
 - Create `core/config.py` containing all configuration dataclasses representing the single source of truth for the app.
 - Create `core/exceptions.py` defining custom exception classes.
 - Create `utils/logger.py` to set up standard logging.
 
 **Section C: Detailed Specifications**
 1. `requirements.txt`: 
-   Define the following packages (use reasonable recent versions): `dlib`, `torch`, `torchvision`, `torchaudio`, `insightface`, `c2pa-python`, `scipy`, `numpy`, `opencv-python`, `streamlit`, `gradio`, `httpx`, `pydantic`, `python-dotenv`.
+   Define the following packages (use reasonable recent versions): `dlib`, `torch`, `torchvision`, `torchaudio`, `torchcodec>=0.9.0`, `insightface`, `c2pa-python`, `scipy`, `numpy`, `opencv-python`, `streamlit`, `gradio`, `httpx`, `pydantic`, `python-dotenv`.
 
 2. `.env.example`:
    Keys to include: `AEGIS_MODEL_DIR=models/`, `AEGIS_DEVICE=auto`, `OLLAMA_ENDPOINT=http://localhost:11434`, `LOG_LEVEL=INFO`.
@@ -44,7 +45,7 @@ This is Phase 0, Day 1: Project Scaffolding & Configuration. Nothing exists yet.
    - `AgentConfig`: fields: `max_retries` (int, default=3), `llm_timeout` (int, default=120), `ollama_endpoint` (str, default="http://localhost:11434").
    - `EnsembleWeights`: EXACT default values: `clip_adapter=0.30`, `sbi=0.20`, `freqnet=0.20`, `rppg=0.15`, `dct=0.10`, `geometry=0.03`, `illumination=0.02`. (Note: C2PA is binary and not weighted).
    - `ThresholdConfig`: EXACT default values: `real_threshold` (float, default=0.15), `fake_threshold` (float, default=0.85), `early_stop_confidence` (float, default=0.85). Optional: add `sbi_skip_clip_threshold` (default=0.70).
-   - `PreprocessingConfig`: fields: `face_crop_size` (int, default=224), `sbi_crop_size` (int, default=380), `native_patch_size` (int, default=224), `max_video_frames` (int, default=300), `min_video_frames` (int, default=90), `extract_fps` (int, default=30).
+   - `PreprocessingConfig`: fields: `face_crop_size` (int, default=224), `sbi_crop_size` (int, default=380), `native_patch_size` (int, default=224), `max_video_frames` (int, default=300), `min_video_frames` (int, default=90), `extract_fps` (int, default=30), `video_backend` (str, default="auto"), `quality_snipe_enabled` (bool, default=True), `quality_snipe_samples` (int, default=5).
    - `AegisConfig`: A master dataclass that groups all instances of the above configs (`models`, `agent`, `weights`, `thresholds`, `preprocessing`). Apply `python-dotenv` here to optionally override with available env vars.
 
 4. `core/exceptions.py`:
@@ -63,6 +64,21 @@ This is Phase 0, Day 1: Project Scaffolding & Configuration. Nothing exists yet.
 - `AegisConfig` must be easily instantiable with sensible defaults out-of-the-box.
 - Use `pathlib.Path` only; do not use raw os/string paths.
 - ONLY use the `logging` module — no `print()` statements.
+
+6. `utils/thresholds.py`:
+   A flat constants file that serves as the **single source of truth** for ALL numeric thresholds used across the entire system. Import from here everywhere — never hardcode thresholds.
+   Constants to define:
+   - Verdict thresholds: `REAL_THRESHOLD = 0.15`, `FAKE_THRESHOLD = 0.85`
+   - Early stop: `EARLY_STOP_CONFIDENCE = 0.85`, `MIN_WEIGHT_FOR_STOP = 0.40`
+   - Tool-specific: `CLIP_FAKE_THRESHOLD = 0.65`, `CLIP_ATTN_CROSS_THRESHOLD = 0.25`, `CLIP_PATCH_REPORT_THRESHOLD = 0.65`
+   - SBI: `SBI_FAKE_THRESHOLD = 0.60`, `SBI_GRADCAM_REGION_THRESHOLD = 0.40`, `SBI_SKIP_CLIP_THRESHOLD = 0.70`, `SBI_BLIND_SPOT_THRESHOLD = 0.30`
+   - FreqNet: `FREQNET_FAKE_THRESHOLD = 0.65`, `FREQNET_Z_THRESHOLD = 1.5`
+   - rPPG: `RPPG_PULSE_PRESENT_THRESHOLD = 0.70`, `RPPG_NO_PULSE_THRESHOLD = 0.30`, `RPPG_SNR_THRESHOLD = 3.0`, `RPPG_MIN_FRAMES = 90`
+   - DCT: `DCT_DOUBLE_QUANT_COMPRESSION_THRESHOLD = 0.70`
+   - Geometry: `GEOMETRY_YAW_SKIP_THRESHOLD = 0.15`
+   - Illumination: `ILLUMINATION_DIFFUSE_THRESHOLD = 0.05`
+   - Ensemble discounts: `SBI_COMPRESSION_DISCOUNT = 0.40`, `FREQNET_COMPRESSION_DISCOUNT = 0.50`
+   - Ensemble weights: `WEIGHT_CLIP = 0.30`, `WEIGHT_SBI = 0.20`, `WEIGHT_FREQNET = 0.20`, `WEIGHT_RPPG = 0.15`, `WEIGHT_DCT = 0.10`, `WEIGHT_GEOMETRY = 0.03`, `WEIGHT_ILLUMINATION = 0.02`, `WEIGHT_CORNEAL = 0.03`
 
 **Section E: Testing & Verification Steps**
 Create a `test_day1.py` script:
@@ -90,10 +106,11 @@ Expected output: A log line printed to the console and appended to `logs/aegis.l
 - `core/config.py`
 - `core/exceptions.py`
 - `utils/logger.py`
-(Depends on: nothing. Enables: Consistent configuration and logging for the rest of the project.)
+- `utils/thresholds.py`
+(Depends on: nothing. Enables: Consistent configuration, logging, and centralized thresholds for the rest of the project.)
 
 #### Day 1 Summary:
-- Files: requirements.txt, .env.example, core/config.py, core/exceptions.py, utils/logger.py
+- Files: requirements.txt, .env.example, core/config.py, core/exceptions.py, utils/logger.py, utils/thresholds.py
 - Depends on: nothing
 - Enables: Day 2 (Base tools) and all future development.
 
@@ -119,7 +136,8 @@ This is Phase 0, Day 2. So far, we have built the configuration (`core/config.py
    - `score`: float (0.0 to 1.0, where 1.0 = maximally fake)
    - `confidence`: float (0.0 to 1.0)
    - `details`: dict (Raw diagnostic details/metrics)
-   - `error`: str | None
+   - `error`: bool (True if tool crashed — this flag gates ensemble exclusion)
+   - `error_msg`: str | None (Error message if crashed, else None)
    - `execution_time`: float (in seconds)
    - `evidence_summary`: str (A strictly formatted natural-language summary for the LLM)
 
@@ -134,8 +152,9 @@ This is Phase 0, Day 2. So far, we have built the configuration (`core/config.py
      2. Open a `try` block and call `self._run_inference(input_data)`.
      3. Ensure the returned `ToolResult` has its `execution_time` set accurately.
      4. Catch *any* `Exception` (`except Exception as e`).
-     5. On exception, log the error using `utils.logger` and return a failure `ToolResult` with EXACTLY:
-        `success=False`, `score=0.5` (neutral so it doesn't skew the ensemble), `confidence=0.0` (so its weight becomes 0), `error=str(e)`, and `evidence_summary=f"Tool {self.tool_name} failed: {str(e)}"`.
+      5. On exception, log the error using `utils.logger` and return a failure `ToolResult` implementing the **Abstention Contract** with EXACTLY:
+         `success=False`, `score=0.0`, `confidence=0.0`, `error=True`, `error_msg=str(e)`, and `evidence_summary=f"Tool {self.tool_name} failed: {str(e)}"`.
+         **CRITICAL**: The score value (0.0) is irrelevant — the `error=True` flag is what gates ensemble exclusion. The ensemble `_route()` function checks the `error` flag and returns `(0.0, 0.0)` (zero contribution, zero weight), so the errored tool drops out entirely. It is NOT treated as voting REAL.
 
 **Section D: Implementation Rules for That Day**
 - Fully typed, Google-style docstrings, Python 3.10+.
@@ -155,14 +174,30 @@ class DummyCrashTool(BaseForensicTool):
     def _run_inference(self, input_data):
         raise RuntimeError("Simulated OOM crash")
 
+class DummyPassTool(BaseForensicTool):
+    @property
+    def tool_name(self) -> str: return "dummy_pass"
+    def setup(self) -> None: pass
+    def _run_inference(self, input_data):
+        return ToolResult(tool_name="dummy_pass", success=True, score=0.8,
+                          confidence=0.9, details={}, error=False, error_msg=None,
+                          execution_time=0.0, evidence_summary="Test passed")
+
 def test_day2():
     tool = DummyCrashTool()
     result = tool.execute("dummy_input")
     assert not result.success
-    assert result.score == 0.5
+    assert result.score == 0.0  # Abstention Contract: errored tools score 0.0
     assert result.confidence == 0.0
-    assert "Simulated OOM crash" in result.error
-    print("✅ Day 2 base tool error contract tested successfully! No crash occurred.")
+    assert result.error is True  # Error FLAG gates ensemble exclusion
+    assert "Simulated OOM crash" in result.error_msg
+    
+    # Verify passing tool works normally
+    pass_tool = DummyPassTool()
+    pass_result = pass_tool.execute("dummy_input")
+    assert pass_result.success
+    assert pass_result.error is False
+    print("✅ Day 2 Abstention Contract tested: crashed tool returns score=0.0, error=True. No crash occurred.")
 
 if __name__ == "__main__":
     test_day2()
@@ -204,14 +239,17 @@ This is Phase 1, Day 3. You have `core/config.py` and base data structures. Toda
    - `is_image(path: Path) -> bool`: Checks extension against a known list (jpg, png, webp, etc).
 
 2. `utils/video.py` functions:
-   - `extract_frames(path: Path, max_frames: int, extract_fps: int) -> list[np.ndarray]`:
-     1. Use `cv2.VideoCapture` to open the video.
-     2. Get native video FPS (`cap.get(cv2.CAP_PROP_FPS)`).
-     3. Calculate frame skip interval to achieve the target `extract_fps` (e.g., Target=30fps, Native=60fps -> Skip every 2nd frame).
-     4. Loop and read frames up to `max_frames`.
-     5. Convert each BGR frame to RGB.
-     6. Return the list of frame numpy arrays.
-   - `get_video_duration(path: Path) -> float`: Return duration in seconds by dividing `CAP_PROP_FRAME_COUNT` by `CAP_PROP_FPS`.
+   - `extract_frames(video_path: str, max_frames: int = 300, target_fps: int = 30) -> list[np.ndarray]`:
+     1. Try importing `VideoDecoder` from `torchcodec.decoders`. Wrap in a `try/except` to determine if `TORCHCODEC_AVAILABLE`.
+     2. If available, initialize the decoder and use `.metadata.num_frames` and `.metadata.average_fps` to compute a `skip` interval based on `target_fps`.
+     3. Generate a list of indices up to `max_frames`.
+     4. Call `decoder.get_frames_at(indices=indices)` (this natively leverages NVDEC GPU if available, or drops to CPU).
+     5. Re-permute from `(B, C, H, W)` to numpy RGB arrays.
+     6. **CRITICAL:** Check logic: If frame width > 1280, use `cv2.resize` to downscale it to 720p or 1080p equivalent to prevent out-of-memory RAM exhaustion on 4K videos.
+     7. **Fallback Pattern:** If TorchCodec import fails, or crashes at runtime, fall back to `cv2`.
+     8. Note: For the `cv2` fallback, define a helper `_extract_cv2` that uses `cv2.VideoCapture()`, loops over frames, resizes if needed, converts BGR to RGB, and returns them as a numpy list.
+   - `get_video_duration(path: Path) -> float`: Try fetching directly via TorchCodec metadata, fallback to `cv2.VideoCapture` frame math.
+   - `is_video_file(path: str) -> bool`: Checks extension against a known list (e.g., `.mp4`, `.avi`, `.mov`).
 
 **Section D: Implementation Rules for That Day**
 - Enforce strict typing.
@@ -229,7 +267,7 @@ def test_day3():
     # Replace with a real path if available
     video_path = Path("sample.mp4")
     if video_path.exists():
-        frames = extract_frames(video_path, max_frames=5, extract_fps=30)
+        frames = extract_frames(str(video_path), max_frames=5, target_fps=30)
         assert isinstance(frames, list)
         assert len(frames) <= 5
         assert frames[0].shape[-1] == 3 # RGB format
@@ -276,28 +314,47 @@ This is Phase 1, Day 4. We are leveraging `dlib` to build a 68-point landmark ex
    - `landmarks`: np.ndarray of shape `[68, 2]`, or None
    - `face_crop_224`: np.ndarray (for CLIP/FreqNet), or None
    - `face_crop_380`: np.ndarray (for SBI), or None
-   - `patch_left_eye`: np.ndarray (224x224 crop centered on `landmarks[36:42]`), or None
-   - `patch_right_eye`: np.ndarray (224x224 crop centered on `landmarks[42:48]`), or None
-   - `patch_hairline`: np.ndarray (224x224 crop vertically above `landmarks[17:27]`), or None
-   - `patch_jaw`: np.ndarray (224x224 crop covering `landmarks[0:17]`), or None
+   - `patch_left_periorbital`: np.ndarray (224x224, landmarks 36–41), or None
+   - `patch_right_periorbital`: np.ndarray (224x224, landmarks 42–47), or None
+   - `patch_nasolabial_left`: np.ndarray (224x224, landmarks 31, 48, 49, 50), or None
+   - `patch_nasolabial_right`: np.ndarray (224x224, landmarks 35, 54, 55, 56), or None
+   - `patch_hairline_band`: np.ndarray (224x224, top 15% of face bbox), or None
+   - `patch_chin_jaw`: np.ndarray (224x224, landmarks 4–12), or None
    - `frames_30fps`: list[np.ndarray], or None (All extracted frames if video)
+   - `selected_frame_index`: int
+   - `selected_frame_sharpness`: float
    - `original_media_type`: str ("image" or "video")
 
 2. `Preprocessor` class:
    - `__init__(self, config: PreprocessingConfig, shape_predictor_path: Path)`: 
-     Load `dlib.get_frontal_face_detector()` and `dlib.shape_predictor(str(shape_predictor_path))`.
+     Load `dlib.get_frontal_face_detector()` and `dlib.shape_predictor(str(shape_predictor_path))`. No MediaPipe — all landmark operations use dlib 68-point only.
    - `_get_landmarks(self, image: np.ndarray) -> np.ndarray | None`: 
-     Run detector. If face found, run predictor. Return exactly 68 `(x, y)` coordinates as a numpy array.
-   - `_crop_align(self, image: np.ndarray, landmarks: np.ndarray, size: int) -> np.ndarray`: 
-     Extract bounding box containing all 68 landmarks, add 20% margin, crop, and resize to `(size, size)`. Use `cv2.INTER_AREA` for downscaling.
-   - `_extract_native_patches(self, image: np.ndarray, landmarks: np.ndarray) -> tuple`:
-     Extract the 4 structural patches at original resolution, resize to 224x224. 
-     - left_eye: tightly bound `landmarks[36:42]` with 30% margin.
-     - right_eye: tightly bound `landmarks[42:48]` with 30% margin.
-     - hairline: Region starting at the top of the forehead bounding box (`landmarks[17:27]`) extending upwards into the hair.
-     - jaw: tightly bound `landmarks[0:17]`.
+     Run detector. If multiple faces are found, select the one with the largest bounding box area. If face found, run predictor. Return exactly 68 `(x, y)` coordinates as a numpy array.
+    - `_crop_align(self, image: np.ndarray, landmarks: np.ndarray, size: int) -> np.ndarray`: 
+      Extract bounding box containing all 68 landmarks, add 20% margin, crop at **native resolution**, and resize to `(size, size)`. **CRITICAL**: Use `cv2.INTER_LANCZOS4` (sinc kernel, 8x8 pixel neighborhood) -- NOT `INTER_AREA` or bilinear. Lanczos preserves 1-8px high-frequency GAN/diffusion artifacts that INTER_AREA averaging destroys.
+    - `_extract_native_patches(self, image: np.ndarray, landmarks: np.ndarray) -> tuple`:
+      Extract **6 anatomical patches** at native resolution, resize each to 224x224 using `cv2.INTER_LANCZOS4`.
+      These 6 crops map directly to the CLIP adapter's Stage 0 (`clip_adapter/landmark_crops.py`):
+      - `left_periorbital`: tightly bound `landmarks[36:42]` (left eye region) with 20% margin.
+      - `right_periorbital`: tightly bound `landmarks[42:48]` (right eye region) with 20% margin.
+      - `nasolabial_left`: tightly bound `landmarks[31, 48, 49, 50]` (left nasolabial fold) with 20% margin.
+      - `nasolabial_right`: tightly bound `landmarks[35, 54, 55, 56]` (right nasolabial fold) with 20% margin.
+      - `hairline_band`: top 15% of face bounding box (hair-skin transition zone).
+      - `chin_jaw`: tightly bound `landmarks[4:13]` (chin and jawline).
+      Each patch: compute bbox from landmarks -> pad 20% -> clamp to image boundaries -> extract at native res -> resize 224x224 via Lanczos4 -> return as uint8 RGB.
+      **Do NOT** downscale the full frame before cropping.
+   - `_select_sharpest_frame(self, frames: list[np.ndarray], face_rect) -> int`:
+     Implement the Quality Snipe filter. Iterate over up to 5 evenly spaced frames from the list. Crop out the `face_rect` boundary, convert to `cv2.COLOR_RGB2GRAY`, and use `cv2.Laplacian` to compute the variance. Return the index of the highest variance (sharpest) frame.
    - `process_media(self, path: Path) -> PreprocessResult`:
-     Check if image or video. Use `utils.video` or `utils.image`. If video, run detection on the very first successful frame to get `landmarks`, and keep all frames for `frames_30fps`. Populate and return the `PreprocessResult`.
+     Check if image or video. Use `utils.video.extract_frames` or `utils.image.load_image`. 
+     If video:
+     1. Extract all frames using `extract_frames()`.
+     2. Search up to the first 10 frames with `self.detector` to establish the primary face bounding box.
+     3. Call `_select_sharpest_frame()` using that bounding box to find the sharpest frame.
+     4. **CRITICAL:** Call `_get_landmarks` again on the *winning* frame to fix sub-pixel shifts caused by motion.
+     5. Store all raw frames in `frames_30fps` for temporal tools (rPPG needs all frames at 30fps for POS pulse extraction).
+     6. Build all subsequent crops/patches exclusively from the *winning frame*'s image and aligned landmarks.
+     Populate and return the `PreprocessResult`.
 
 **Section D: Implementation Rules for That Day**
 - Handle `ValueError` or missing face smoothly by returning `PreprocessResult` initialized to `has_face=False`.
@@ -358,9 +415,10 @@ This is Phase 1, Day 5. Setting up robust sequential PyTorch VRAM lifecycle mana
    - Else return `torch.device("cpu")`
 
 2. `VRAMLifecycleManager` Context Manager:
+   - Must contain a class-level global lock (e.g. `import threading; _gpu_lock = threading.Lock()`) to prevent concurrent Gradio requests from crashing the GPU.
    - `__init__(self, model_loader_function, *args, **kwargs)`: Store arguments.
    - `__enter__(self) -> torch.nn.Module`:
-     1. Optional: Wait/verify no other GPU models are active (thread lock).
+     1. Acquire the global lock: `self.__class__._gpu_lock.acquire()`
      2. Execute `model = self.model_loader_function(*self.args, **self.kwargs)`.
      3. Move model to `get_device()` using `model.to(device)`.
      4. Set `model.eval()`.
@@ -371,6 +429,7 @@ This is Phase 1, Day 5. Setting up robust sequential PyTorch VRAM lifecycle mana
      2. If device is CUDA: call `torch.cuda.empty_cache()`
      3. If device is MPS: call `torch.mps.empty_cache()`
      4. Force python garbage collection: `import gc; gc.collect()`
+     5. Release the global lock: `self.__class__._gpu_lock.release()`
 
 **Section D: Implementation Rules for That Day**
 - Enforce strict adherence to resource clearing. PyTorch does not immediately release GPU RAM when variables go out of scope. The `del` + `empty_cache` + `gc.collect` combo is mandatory.

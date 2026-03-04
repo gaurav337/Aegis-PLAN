@@ -17,13 +17,42 @@ This is Phase 5, Day 18. We are building the asynchronous Python controller that
 - `class OllamaClient`:
   - `def __init__(self, config: AgentConfig)`: Store the endpoint (e.g., `http://localhost:11434`) and timeout settings.
   - `async def check_health(self) -> bool`: Ping the Ollama API `/api/tags` endpoint using `httpx`. Return `True` if responsive, `False` otherwise.
-  - `async def generate(self, prompt: str, system_prompt: str = "") -> str`:
+  - `async def generate(self, prompt: str, system_prompt: str = "", stream_callback=None) -> str`:
     - Use `httpx.AsyncClient` to POST to `http://localhost:11434/api/generate`.
-    - Payload: `{"model": config.phi3_model, "prompt": prompt, "system": system_prompt, "stream": False, "options": {"temperature": 0.1}}`. 
-    - Temperature MUST be low (0.1) to avoid hallucinations in forensic reporting.
-    - Keep timeouts high (e.g., 120s) because the 4GB GPU might be swapping weights, making the LLM inferences slower.
-    - Extract and return the `"response"` string from the JSON.
-    - If the request fails or times out, return a fallback string: "LLM synthesis failed or timed out. Relying on raw ensemble score."
+    - Payload: `{"model": config.phi3_model, "prompt": prompt, "system": system_prompt, "stream": True, "options": {"temperature": 0.1, "num_predict": 512, "top_p": 0.9}}`.
+    - Temperature MUST be `0.1` (deterministic forensic reasoning).
+    - `num_predict: 512` caps response length.
+    - **No stop sequences** — rely on Phi-3 native `<|end|>` EOS token.
+    - Keep timeouts high (120s) for 4GB VRAM systems.
+
+    **Streaming:**
+    - Set `"stream": True` in payload.
+    - Iterate over response lines: `async for line in response.aiter_lines()`.
+    - Parse each line as JSON, extract `"response"` token.
+    - If `stream_callback` is provided, call `stream_callback(token)` for real-time UI updates.
+    - Accumulate full response string.
+
+    **JSON Repair Pipeline** (applied to accumulated response before returning):
+    1. **Markdown fence strip:** Detect ` ```json ` wrappers and strip them. Phi-3 wraps JSON in markdown code fences even when told not to.
+       ```python
+       if response.startswith("```"):
+           response = re.sub(r'^```\w*\n?', '', response)
+           response = re.sub(r'\n?```$', '', response)
+       ```
+    2. **Trailing comma fix:** `re.sub(r',\s*}', '}', response)` and `re.sub(r',\s*]', ']', response)`.
+    3. **Attempt `json.loads()`**. If it fails, move to retry.
+
+    **Retry Logic:**
+    - Hidden inside `generate()` — max 2 retries (3 attempts total).
+    - Each retry re-sends the same prompt with an appended instruction: "Respond with valid JSON only. No markdown formatting."
+    - If all retries fail, return a fallback `INCONCLUSIVE` dict:
+      ```python
+      {"verdict": "INCONCLUSIVE", "confidence": 0.5,
+       "reasoning": "LLM synthesis failed after 3 attempts. Relying on raw ensemble score."}
+      ```
+
+    **Health Check:**
+    Pre-flight `GET /api/tags` before first generation to verify Ollama is running. Cache the health status.
 
 **Section D: Implementation Rules for That Day**
 - Handle `httpx.ConnectError` gracefully. (Ollama might not be started by the user yet).
@@ -115,7 +144,7 @@ from core.data_types import ToolResult
 from core.prompts.forensic_summary import build_user_prompt, SYSTEM_PROMPT
 
 def test_day19():
-    res = ToolResult("run_rppg", True, score=0.9, confidence=0.8, details={}, execution_time_ms=0, evidence_summary="Flatline pulse detected.")
+    res = ToolResult("run_rppg", True, score=0.9, confidence=0.8, details={}, execution_time=2.1, evidence_summary="Flatline pulse detected.")
     
     prompt = build_user_prompt(0.95, False, [res])
     
@@ -156,7 +185,13 @@ This is Phase 5, Day 20. We are building the `AgentState` dataclass and the `set
 - Implement `ForensicAgent` initialization and media preprocessing.
 
 **Section C: Detailed Specifications**
-1. `class AgentState`:
+1. `class AgentEvent`:
+   An event yielded by the agent generator for real-time UI updates:
+   - `event_type: str` — one of: `"tool_start"`, `"tool_complete"`, `"early_stop"`, `"llm_start"`, `"llm_token"`, `"verdict"`, `"error"`
+   - `tool_name: str | None`
+   - `data: dict` — event-specific payload (tool result, token, score, etc.)
+
+2. `class AgentState`:
    - `media_path: Path`
    - `original_media_type: str` (image/video)
    - `preprocessed_data: PreprocessResult | None = None`
@@ -176,17 +211,26 @@ This is Phase 5, Day 20. We are building the `AgentState` dataclass and the `set
      - Instantiate `self.llm = OllamaClient(config.agent)`.
      - Instantiate `self.early_stopping = EarlyStoppingController(config.thresholds)`.
      - Instantiate `self.memory = MemorySystem()`.
-   - `async def analyze(self, media_path: str) -> AgentState`:
-     - This is the main entry point. 
-     - Initialize `state = AgentState(media_path=Path(media_path), start_time=time.time())`.
-     - `try:`
-       - Call `state.preprocessed_data = self.preprocessor.process_media(state.media_path)`.
-       - (Leave space here for Day 21 tool logic).
-     - `except Exception as e`:
-       - Log error, set `state.error = str(e)`.
-     - `finally:`
-       - `state.end_time = time.time()`.
-       - Return `state`.
+   - `async def analyze(self, media_path: str) -> AsyncGenerator[AgentEvent, None]`:
+      **Generator-based architecture.** The agent yields `AgentEvent` objects for real-time UI updates. Each tool completion yields an event that the UI can render immediately.
+      - Initialize `state = AgentState(media_path=Path(media_path), start_time=time.time())`.
+      - `try:`
+        - Call `state.preprocessed_data = self.preprocessor.process_media(state.media_path)`.
+        - (Leave space here for Day 21 tool logic -- each tool yields events via `yield from _run_tool(...)`).
+      - `except Exception as e`:
+        - Log error, set `state.error = str(e)`.
+        - `yield AgentEvent(event_type="error", data={"message": str(e)})`
+      - `finally:`
+        - `state.end_time = time.time()`.
+        - `yield AgentEvent(event_type="verdict", data={"state": state})`
+
+   - `async def _run_tool(self, tool_name: str, tool_input: dict, state: AgentState) -> AsyncGenerator[AgentEvent, None]`:
+      Sub-generator for running a single tool. Uses Python 3.3+ `yield from` pattern:
+      - `yield AgentEvent(event_type="tool_start", tool_name=tool_name)`
+      - `result = self.registry.execute_tool(tool_name, tool_input)`
+      - `state.tool_results.append(result)`
+      - `yield AgentEvent(event_type="tool_complete", tool_name=tool_name, data={"result": result})`
+      - Return result for caller to use.
 
 **Section D: Implementation Rules for That Day**
 - Import all the heavy classes. This file links everything together.
@@ -241,12 +285,11 @@ This is Phase 5, Day 21. We are injecting the core execution loop into `core/age
 
 **Section C: Detailed Specifications**
 - Inside the `try/except` block of `analyze` (after preprocessing):
-  1. Define `execution_queue = ["check_c2pa", "run_geometry", "run_illumination", "run_sbi", "run_clip_adapter", "run_freqnet", "run_rppg"]`. (Order heavily prioritizes CPU tools first to trigger early stopping fast).
+  1. Define `execution_queue = ["check_c2pa", "run_rppg", "run_dct", "run_geometry", "run_illumination", "run_corneal", "run_clip_adapter", "run_sbi", "run_freqnet"]`. (CPU tools first, then GPU tools. **CRITICAL**: `run_clip_adapter` MUST execute before `run_sbi` to provide the conditional skip score! Also, `run_dct` before GPU tools so its `double_quant` score can discount SBI/FreqNet weights.).
   2. For each `tool_name` in `execution_queue`:
      - **Check conditions**: If `tool_name == "run_rppg"` and `state.preprocessed_data.original_media_type != "video"`, skip.
-     - Build `tool_input`: Pass the entire `PreprocessResult` dict. Crucially, calculate `current_clip_score` from `state.tool_results` and pass it into `tool_input["clip_score"]` so the SBI tool (Day 12) can use its skip logic.
-     - Call `result = self.registry.execute_tool(tool_name, tool_input)`.
-     - Append `result` to `state.tool_results`.
+     - Build `tool_input`: Convert `state.preprocessed_data` to a dict. Explicitly inject `tool_input["media_path"] = str(state.media_path)` so the C2PA tool can read the file. Crucially, calculate `current_clip_score` from `state.tool_results` and pass it into `tool_input["clip_score"]` so the SBI tool (Day 12) can use its skip logic.
+      - Call `async for event in self._run_tool(tool_name, tool_input, state): yield event` -- uses generator sub-routine to bubble real-time progress events to UI while collecting tool results.
      - Calculate intermediate ensemble: `agg = calculate_ensemble_score(state.tool_results)`.
      - Update `state.ensemble_score = agg["ensemble_score"]` and `state.is_c2pa_override = agg["is_c2pa_override"]`.
      - **Early Stopping**: 
@@ -271,7 +314,7 @@ async def test_day21():
     agent = ForensicAgent(AegisConfig())
     # Assuming test_image.jpg exists and you have standard models loaded:
     # state = await agent.analyze("test_image.jpg")
-    # print(f"Executed {len(state.tool_results)} tools out of 7. Score: {state.ensemble_score}")
+    # print(f"Executed {len(state.tool_results)} tools out of 9. Score: {state.ensemble_score}")
     print("✅ Day 21 Execution Loop logic added (Requires full models to run e2e).")
 
 if __name__ == "__main__":

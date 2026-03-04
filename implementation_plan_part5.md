@@ -197,8 +197,9 @@ This is Phase 7, Day 26. We are writing the `pytest` scaffold and unit tests for
    - Create pytest fixtures that return a dummy image `np.ndarray` and a dummy video (create an mp4 locally using `cv2.VideoWriter`).
    
 2. `tests/test_utils.py`:
-   - Test `utils.video.extract_frames`
+   - Test `utils.video.extract_frames`. Ensure fallback logic doesn't crash.
    - Test `utils.preprocessing.Preprocessor._get_landmarks`. Test behavior when NO face is present.
+   - Test `utils.preprocessing.Preprocessor._select_sharpest_frame` works accurately.
 
 3. `tests/test_ensemble.py`:
    - Bring over the logic from `test_day15.py` into formal `assert` statements within `pytest`.
@@ -271,9 +272,10 @@ This is Phase 7, Day 28.
   - Use `nvidia/cuda:12.1.0-runtime-ubuntu22.04` as the base image.
   - Install python3.10 and pip.
   - Use `--mount=type=cache` with pip to speed up reinstalls.
+  - Add `EXPOSE 8501` to allow Streamlit traffic.
   - `CMD ["streamlit", "run", "app.py"]`
 - `docker-compose.yml`:
-  - Define `aegis-core`: the python build.
+  - Define `aegis-core`: the python build. MUST include a `volumes` mount mapping `./models:/app/models` to prevent the container from re-downloading 3GB of models on every restart.
   - Define `aegis-ollama`: attach the official Ollama docker image `ollama/ollama`. Ensure `aegis-core` can reach it on port `11434`.
 
 **Section D: Implementation Rules for That Day**
