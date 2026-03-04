@@ -116,17 +116,19 @@ This is Phase 5, Day 19. We are defining the system prompts and context injectio
   "You are the Aegis-X Forensic Interpreter. You receive raw tool metrics and an ensemble probability score regarding a media file's authenticity. Your job is to summarize the findings for a human analyst. Do not hallucinate. Do not invent metrics. You must strictly use the evidence provided. If tools contradict each other, state the conflict clearly. Conclude with a definitive, single-sentence verdict: 'The media is likely REAL/FAKE.' Keep your summary under 150 words."
   
 - Define `def build_user_prompt(ensemble_score: float, is_c2pa: bool, tool_results: list[ToolResult], history_matches: list[dict] = None) -> str`:
-  - Compose a strict, structured context block:
-    ```
+  - Compose a strict, structured context block that partitions evidence by Tracking ID (Subject 0, Subject 1, etc.):
+    ```text
     === AEGIS-X FINAL ENSEMBLE ===
-    Ensemble Fake Probability: {ensemble_score * 100}%
+    Ensemble Fake Probability (Highest anomalous actor): {ensemble_score * 100}%
     C2PA Override Active: {is_c2pa}
     
-    === TOOL EVIDENCE ===
+    === MULTI-SUBJECT TOOL EVIDENCE ===
     [Loop through tool_results where success=True]
     - Tool: {tool.tool_name}
       Confidence assigned: {tool.confidence}
-      Evidence: {tool.evidence_summary}
+      Evidence: 
+        - Subject 0 (Tracking ID 0): {tool.evidence_summary_subject_0}
+        - Subject 1 (Tracking ID 1): {tool.evidence_summary_subject_1}
       
     === HISTORICAL CONTEXT ===
     [If history_matches is provided and not empty]

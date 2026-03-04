@@ -38,16 +38,11 @@ This is the most architecturally complex tool in Aegis-X. It consists of a froze
     - Load adapter weights from config path. If missing, log warning and use zero-shot fallback.
     - Return `(clip_model, adapter)`.
 
-**Stage 0: Landmark Crop Extraction** (`landmark_crops.py`):
-  - Input: frame `(H,W,3)` + landmarks `(478,2)`
-  - Extract **6 anatomical crops**, each targeting a region where forgery artifacts concentrate:
-    - `[0] left_periorbital` (landmarks 33,133,160,159,158,144)
-    - `[1] right_periorbital` (landmarks 263,362,385,386,387,373)
-    - `[2] nasolabial_left` (landmarks 92, 205, 216, 206)
-    - `[3] nasolabial_right` (landmarks 322, 425, 436, 426)
-    - `[4] hairline_band` (landmarks 10, 338, 297, 332, 284, 103, 67)
-    - `[5] chin_jaw` (landmarks 172,136,150,149,176,148,152,377,400,379,365)
-  - Per crop: compute bbox from landmarks → pad 20% → clamp to image boundaries → extract at native resolution → resize to 224×224 using `cv2.INTER_LANCZOS4` → apply CLIP normalization (mean `[0.48145466, 0.4578275, 0.40821073]`, std `[0.26862954, 0.26130258, 0.27577711]`) → output `(1, 3, 224, 224)` tensor.
+**Stage 0: Tensor Normalization & Preparation**:
+  - The heavy image cropping is already executed by the `Preprocessor` (Day 4).
+  - For each `face` in `input_data["tracked_faces"]`, load the 6 anatomical patches: `patch_left_periorbital`, `patch_right_periorbital`, `patch_nasolabial_left`, `patch_nasolabial_right`, `patch_hairline_band`, `patch_chin_jaw`.
+  - Convert each from `uint8` RGB numpy arrays to float32 tensors. Apply CLIP normalization (mean `[0.48145466, 0.4578275, 0.40821073]`, std `[0.26862954, 0.26130258, 0.27577711]`).
+  - Output shape per patch must be `(1, 3, 224, 224)`.
 
 **Stage 1: Patch Token Extraction** (`patch_extractor.py`):
   - Per crop: forward through frozen CLIP ViT-B/32.
@@ -111,17 +106,17 @@ from core.config import AegisConfig
 def test_day11():
     tool = ClipAdapterTool()
     
-    # Create dummy patches (6 anatomical crops per README)
-    patches = {
+    # Create dummy tracked faces with 6 anatomical crops per README
+    dummy_tracked_faces = [{"identity_id": 0, 
         "patch_left_periorbital": np.zeros((224, 224, 3), dtype=np.uint8),
         "patch_right_periorbital": np.zeros((224, 224, 3), dtype=np.uint8),
         "patch_nasolabial_left": np.zeros((224, 224, 3), dtype=np.uint8),
         "patch_nasolabial_right": np.zeros((224, 224, 3), dtype=np.uint8),
         "patch_hairline_band": np.zeros((224, 224, 3), dtype=np.uint8),
         "patch_chin_jaw": np.zeros((224, 224, 3), dtype=np.uint8),
-    }
+    }]
     
-    result = tool.execute(patches)
+    result = tool.execute({"tracked_faces": dummy_tracked_faces})
     print(f"CLIP Adapter logic evaluated: Score {result.score}, Success: {result.success}")
     assert result.success is True
     assert 0.0 <= result.score <= 1.0
@@ -168,12 +163,12 @@ This is Phase 3, Day 12. We are implementing the SBI (Self-Blended Images) detec
     - Replaces the classifier head to output a single value (`in_features=1792`, `out_features=1`).
     - Loads weights from `AegisConfig().models.sbi_weights`. (If missing, default to neutral random initialized for testing, but log warning).
   - `def _run_inference(self, input_data: dict) -> ToolResult`:
-    - Expected input: `input_data["face_crop_380"]`, `input_data["landmarks"]`. If missing, return `score=0.0, error=True`.
-    - **CRITICAL Conditional Skip**: The agent provides `input_data["clip_score"]`. If `clip_score > 0.70` (from `thresholds.SBI_SKIP_CLIP_THRESHOLD`), the face is fully synthetic → SBI cannot detect it (no blend boundary exists). Return `success=True, score=0.0, confidence=0.0, evidence_summary="Skipped SBI: High CLIP score indicates fully synthetic face (not face-swap). SBI only detects blend boundaries."`. Ensemble receives `(0.0, 0.0)` (abstention).
+    - Expected input: `input_data["tracked_faces"]`. If missing, return `score=0.0, error=True`. Iterate over `face` in `tracked_faces`. Ensure `face["face_crop_380"]` and `face["landmarks"]` exists.
+    - **CRITICAL Conditional Skip**: Evaluate `clip_score` from `context`. If `clip_score > 0.70` (from `thresholds.SBI_SKIP_CLIP_THRESHOLD`), the face is fully synthetic → SBI cannot detect it. Skip.
     - Wrap inference: `with VRAMLifecycleManager(self._load_model) as model:`
 
-    **Dual-Scale Cropping:**
-    - Compute face bbox from MediaPipe 478 landmarks (which inherently includes the whole head/forehead). Extract TWO context-expanded crops:
+    **Dual-Scale Cropping (Per Tracked Face):**
+    - Compute face bbox from `face["landmarks"]` (which inherently includes the whole head/forehead). Extract TWO context-expanded crops:
       - **1.15× scale**: `bbox expanded by 15%` → captures tight context around FaceMesh
       - **1.25× scale**: `bbox expanded by 25%` → captures wider context (catches different mask sizes)
       - Both: native crop → Lanczos4 → 380×380 → ImageNet normalize (NOT CLIP normalize)
@@ -216,7 +211,8 @@ from core.tools.sbi_tool import SBITool
 
 def test_day12():
     tool = SBITool()
-    dummy_input = {"face_crop_380": np.zeros((380, 380, 3), dtype=np.uint8)}
+    dummy_tracked_faces = [{"identity_id": 0, "face_crop_380": np.zeros((380, 380, 3), dtype=np.uint8), "landmarks": np.zeros((478, 2))}]
+    dummy_input = {"tracked_faces": dummy_tracked_faces}
     
     # 1. Test Skip Logic
     skip_input = {**dummy_input, "clip_score": 0.85}
@@ -279,11 +275,11 @@ This is Phase 3, Day 13 of the Aegis-X build. We are implementing the final GPU 
       - **CASE B (external DCT):** no → we must provide external frequency input via `preprocessor.py`.
     - Load calibration baseline from `calibration/freqnet_fad_baseline.pt` via `calibration.py`.
   - `def _run_inference(self, input_data: dict) -> ToolResult`:
-    - Expected input: `input_data["face_crop_224"]`, `input_data["landmarks"]`.
-    - If missing, return `score=0.0, error=True`.
+    - Expected input: `input_data["tracked_faces"]`.
+    - If missing, return `score=0.0, error=True`. Iterate across each `face`. Read `face["face_crop_224"]` and `face["landmarks"]`.
     - Wrap inference: `with VRAMLifecycleManager(self._load_model) as model:`
 
-    **Preprocessing:**
+    **Preprocessing (Per Tracked Face):**
     - Face crop: 1.1× expansion → native crop → Lanczos4 → 224×224 → `to_tensor [0,1]`
 
     **Stream 1 (Spatial):** ImageNet normalize → `(1, 3, 224, 224)`
@@ -333,7 +329,8 @@ from core.tools.freqnet_tool import FreqNetTool
 
 def test_day13():
     tool = FreqNetTool()
-    dummy_input = {"face_crop_224": np.ones((224, 224, 3), dtype=np.uint8) * 128}
+    dummy_tracked_faces = [{"identity_id": 0, "face_crop_224": np.ones((224, 224, 3), dtype=np.uint8) * 128, "landmarks": np.zeros((478, 2))}]
+    dummy_input = {"tracked_faces": dummy_tracked_faces}
     
     res = tool.execute(dummy_input)
     assert res.success is True
@@ -453,6 +450,7 @@ Import all constants from `utils/thresholds.py` (weights, discount factors, tool
 4. Discount scales BOTH numerator AND denominator.
 5. rPPG uses discrete probability, not continuous score × weight.
 6. `PULSE_PRESENT` returns `(0.0, 0.15)` NOT `(-0.15, 0.15)` — no negative probabilities.
+7. **Identity Max Pooling:** Tools evaluating multiple `TrackedFaces` output the single highest structural fake score among all actors. The ensemble fundamentally bases its `0.0 - 1.0` calculation on the most anomalous subject in the frame.
 
 - `def _route(tool_result: ToolResult, context: dict) -> tuple[float, float]`:
   Per-tool routing function. `context` contains `dct_double_quant` and `clip_score` from other tools.
@@ -555,7 +553,7 @@ This is Phase 4, Day 16. We are building the logic that evaluates if the current
   - `def evaluate(self, current_ensemble_score: float, tools_run: list[str], tools_pending: list[str]) -> bool:`
     - Uses threshold bounds (`0.15` and `0.85` by default). Get base weights from `AegisConfig`. Compute `total_base_weights_run = sum(base_weights[t] for t in tools_run)`.
     - Condition 1 (C2PA Signed): If `check_c2pa` was run and `current_ensemble_score == 0.0` (override triggered), STOP = True.
-    - Condition 2: If `current_ensemble_score > 0.85` AND `total_base_weights_run > 0.40`, STOP = True. (Locked fake. The 0.40 check prevents catastrophic early stopping if only one tiny 0.03 weight tool has run).
+    - Condition 2: If `current_ensemble_score > 0.85` AND `total_base_weights_run > 0.40`, STOP = True. (Locked fake. This executes if *any single tracked face* heavily biases the multi-subject maximal ensemble score).
     - Condition 3: If `current_ensemble_score < 0.15` AND `total_base_weights_run > 0.40`, STOP = True. (Locked real).
     - Condition 4 (Diminishing potential): Calculate the theoretical maximum remaining weight. If the pending tools possess too little weight to possibly pull the current score out of the "verdict threshold zone", STOP = True.
   - Return `True` to halt analysis, `False` to continue executing tools.

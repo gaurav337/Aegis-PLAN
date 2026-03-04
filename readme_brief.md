@@ -20,9 +20,10 @@ General-purpose CNNs overfit to the generator they were trained on. Aegis-X repl
 flowchart TD
     A["📂 Media Input\n(image / video)"] --> B["🎞️ Frame Extraction\nTorchCodec → RGB\nMax 300 frames @ 30fps"]
     B --> C["🔬 Quality Snipe\nLaplacian variance\nSelect sharpest of 5"]
-    C --> D["🕸️ MediaPipeDetector\nFaceMesh refine_landmarks=True\n478-point mesh — single unified detector"]
+    C --> D["🕸️ MediaPipeDetector\nFaceMesh refine_landmarks=True\n478-point mesh → 1 to N faces"]
     D -->|"No face\ndetected"| E["📊 Whole-image\nFrequency Analysis Only"]
-    D -->|"Face + 478 landmarks"| F["✂️ Crop & Patch Extraction\n224×224 / 380×380 face crops\n6 anatomical patches @ native res\nLanczos4 — preserves HF artifacts"]
+    D -->|"Faces Detected"| SORT["🎯 CPU-SORT Tracker\nKalman + IoU Multi-Subject Match\nFilters out jitter & drift"]
+    SORT -->|For Face_0 ... Face_N| F["✂️ Crop & Patch Extraction\n224×224 / 380×380 face crops\n6 anatomical patches @ native res\nLanczos4 — preserves HF artifacts"]
     F --> G
 
     subgraph CPU ["⚙️ CPU Phase — Zero VRAM · Zero Generalization Gap"]
@@ -37,15 +38,15 @@ flowchart TD
     L --> M{{"🚦 Confidence Gate\n> 0.85 → skip GPU\nsave 40-80% compute"}}
     M -->|"< 0.85"| N
 
-    subgraph GPU ["🖥️ GPU Phase — Sequential VRAM · Load → Infer → Free"]
+    subgraph GPU ["🖥️ GPU Phase — Sequential Batching · Load → Infer → Free"]
         N["🧠 CLIP Adapter\nViT-B/32 frozen + 3.8MB forensic MLP\n6 anatomical patch crops"] --> O{{"⛔ Early-Stop\n> 0.85 after CLIP"}}
         O --> P["🪡 SBI — Blend Boundary\nEfficientNet-B4 @ 380×380\n1.15×/1.25× crops\nSkipped if CLIP score > 0.7"]
         P --> Q["📡 FreqNet — FAD Dual-Stream\nF3Net ResNet-50\nSpatial + Frequency cross-attention"]
     end
 
     M -->|"> 0.85"| R
-    Q --> R["⚖️ Ensemble Scoring\nWeighted (contribution, eff_weight)\nAbstention contract enforced"]
-    R --> S["🧠 Phi-3 Mini 3.8B\nStructured text reasoning\nNO raw pixels ever reach LLM"]
+    Q --> R["⚖️ Ensemble Scoring\nHighest Fake Score dictates Anomaly"]
+    R --> S["🧠 Phi-3 Mini 3.8B\nStructured text reasoning\nEvidence Partitioned by Identity"]
     S --> T["📋 Verdict\n✅ REAL / ❌ FAKE / ⚠️ INCONCLUSIVE\n+ Natural language explanation"]
 ```
 
@@ -78,7 +79,7 @@ class MediaPipeDetector:
     def __init__(self):
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=True,     # Each call treated as independent image
-            max_num_faces=1,            # Forensic context: primary face only
+            max_num_faces=config.preprocessing.max_subjects_to_analyze,  # Configurable up to N faces
             refine_landmarks=True,      # CRITICAL: enables iris + attention mesh
                                         # Adds nodes 468–477 (10 iris/pupil points)
                                         # Without this, nodes 468–477 are absent
@@ -92,12 +93,12 @@ class MediaPipeDetector:
         Args:
             img: (H, W, 3) uint8 RGB — must be RGB, not BGR
         Returns:
-            (NormalizedLandmarkList | None, source_str)
+            (list[NormalizedLandmarkList] | None, source_str)
         """
         results = self.face_mesh.process(img)  # expects RGB
         if not results.multi_face_landmarks:
             return None, "none"
-        return results.multi_face_landmarks[0], "mediapipe"
+        return results.multi_face_landmarks, "mediapipe"
 ```
 
 **Why `refine_landmarks=True` is non-negotiable:**
@@ -121,6 +122,39 @@ landmarks = np.array(
 
 **Robust Face Detection:** MediaPipe handles difficult angles and occlusions robustly in a single pass, and when it does fail, the agent correctly routes to the `landmarks is None` fallback path — GPU tools still run, the agent still produces a verdict. This perfectly maintains the **"Zero VRAM, Zero Generalization Gap"** philosophy for the CPU phase.
 
+### 1.2.1 Multi-Subject Temporal Tracking (CPU-SORT)
+
+**The "Foreground Decoy" Vulnerability:** A naive preprocessing pipeline evaluates only the largest face in a frame. This creates a severe blind spot in "in-the-wild" datasets (e.g., WildDeepfake) or real-world investigations: if a real subject stands in the foreground while a deepfaked subject stands in the background, the system evaluates the authentic pixels, scores it as `✅ REAL`, and misses the manipulation entirely. 
+
+To mitigate this without violating the CPU phase's "Zero VRAM" philosophy, Aegis-X upgrades from a stateless single-face heuristic to a **stateful multi-subject temporal tracker**, driven entirely by CPU mathematics.
+
+**Algorithm: MediaPipe + CPU-SORT (ByteTrack-style IoU)**
+Instead of relying on heavy Re-ID CNNs (like DeepSORT) which require ~300MB of GPU VRAM, we pair MediaPipe's raw coordinate output with a native Python implementation of the SORT tracking algorithm. 
+1. **Detection:** MediaPipe extracts all bounding boxes in the frame.
+2. **Prediction:** A Kalman Filter predicts the spatial state vector $[u, v, s, r, \dot{u}, \dot{v}, \dot{s}, \dot{r}]^T$ for each known track.
+3. **Association:** The Hungarian algorithm solves the bipartite matching problem between predicted tracks and new detections using pure Intersection-over-Union (IoU) costs.
+
+| Property | Value |
+|:---------|:------|
+| **VRAM Cost** | **0 MB** (preserves the GPU phase isolation) |
+| **Compute Cost** | ~1-2ms per frame (native CPU matrix operations) |
+| **Temporal Stability** | Eliminates spatial drift during the 1.6s `run_rppg()` window, ensuring the POS algorithm samples the exact same anatomical region even if subjects cross paths. |
+
+**Resource Bounding: The `max_subjects_to_analyze` Gate**
+Tracking multiple faces introduces an $O(N)$ time complexity multiplier to the pipeline. Analyzing 10 tiny faces in a crowd wastes compute on subjects lacking the pixel density required for valid physical signal extraction (e.g., corneal specular highlights or rPPG temporal frequencies). 
+
+We enforce a strict upper bound via `config.yaml`:
+```yaml
+preprocessing:
+  max_subjects_to_analyze: 2  # Evaluates the 2 largest tracked identities
+  min_face_resolution: 64     # Skips tracks where bounding box < 64x64 pixels
+```
+
+**Execution Flow Contract Updates:**
+
+*   **CPU Phase:** Runs independently for each tracked identity (Face_0, Face_1). If Face_0 is 0.10 and Face_1 is 0.92, the highest fake score dictates the anomaly flag.
+*   **GPU Phase (Sequential Batching):** To maintain the strict 4GB VRAM ceiling, GPU tools do not reload per face. The agent loads the model once, batches Face_0 and Face_1 sequentially, and then executes the non-negotiable `finally: torch.cuda.empty_cache()` block.
+*   **LLM Synthesis:** The Phi-3 prompt injection now receives a structured dictionary of evidence partitioned by identity (e.g., "Subject 0 (Foreground): ... Subject 1 (Background): ..."), allowing the LLM to output precise, multi-actor forensic verdicts.
 
 
 ### 1.3 Quality Snipe — Sharpest Frame Selection
@@ -154,13 +188,20 @@ All crops are built from the winning frame at **native resolution first**, then 
 ```python
 PreprocessResult(
     has_face=True,
-    landmarks=landmarks,           # (478, 2) from winning frame
-    face_crop_224=face_crop_224,   # 224×224 for DCT, CLIP, FreqNet
-    face_crop_380=face_crop_380,   # 380×380 for SBI
-    patch_left_eye=...,            # 6 native-res patches for CLIP adapter
-    patch_right_eye=...,
-    patch_hairline=...,
-    patch_jaw=...,
+    tracked_faces=[
+        TrackedFace(
+            identity_id=0,
+            landmarks=landmarks_0,           # (478, 2) from winning frame
+            trajectory_bboxes=...,           # dict: frame_idx -> [x1, y1, x2, y2]
+            face_crop_224=face_crop_224_0,   # 224×224 for DCT, CLIP, FreqNet
+            face_crop_380=face_crop_380_0,   # 380×380 for SBI
+            patch_left_eye=...,              # 6 native-res patches for CLIP adapter
+            patch_right_eye=...,
+            patch_hairline=...,
+            patch_jaw=...,
+        ),
+        # ... up to max_subjects_to_analyze
+    ],
     frames_30fps=frames,           # ALL frames for rPPG temporal signal
     selected_frame_index=best_idx, # Diagnostic only — no downstream tool reads this
     original_media_type="video",

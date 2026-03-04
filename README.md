@@ -417,40 +417,42 @@ stateDiagram-v2
         note right of FrameExtract : TorchCodec fast decode\ncv2 fallback always works
     }
 
-    PREPROCESSING --> CPU_PHASE : Preprocessing complete\nVRAM used: 0 GB
+    PREPROCESSING --> CPU_PHASE : Preprocessing complete\nCPU-SORT Active\nTracking N Identities\nVRAM used: 0 GB
 
     state CPU_PHASE {
-        [*] --> C2PA_State
+        [*] --> Loop_Identities
+        Loop_Identities --> C2PA_State : For Face_0, Face_1...
         C2PA_State --> RPPG_State : Not signed
         C2PA_State --> [*] : Signed — early exit
         RPPG_State --> DCT_State : Video only
         DCT_State --> GEO_State
         GEO_State --> ILLUM_State
-        ILLUM_State --> [*]
+        ILLUM_State --> Loop_Identities : Next Identity
+        Loop_Identities --> [*] : All tracked subjects complete
         note right of RPPG_State : Output: liveness bool\nFFT SNR > threshold (0.7-2.5Hz)
         note right of GEO_State : Output: violations list\n7 anthropometric checks
     }
 
-    CPU_PHASE --> CONFIDENCE_CHECK_1 : All CPU tools done\nVRAM still: 0 GB
+    CPU_PHASE --> CONFIDENCE_CHECK_1 : All CPU tools done for all faces\nVRAM still: 0 GB
 
     state CONFIDENCE_CHECK_1 <<choice>>
-    CONFIDENCE_CHECK_1 --> SYNTHESIS : confidence > 0.85\nEarly stopping triggered
-    CONFIDENCE_CHECK_1 --> GPU_PHASE : confidence ≤ 0.85\nNeed more evidence
+    CONFIDENCE_CHECK_1 --> SYNTHESIS : Any face confidence > 0.85\nEarly stopping triggered
+    CONFIDENCE_CHECK_1 --> GPU_PHASE : All faces ≤ 0.85\nNeed more evidence
 
     state GPU_PHASE {
         [*] --> CLIP_Load
-        CLIP_Load --> CLIP_Infer : VRAM: +600MB
+        CLIP_Load --> CLIP_Infer : Sequential Batching (Face_0, Face_1)\nVRAM: +600MB
         CLIP_Infer --> CLIP_Unload
         CLIP_Unload --> SBI_Load : del model\nempty_cache()\nVRAM: back to 0
-        SBI_Load --> SBI_Infer : VRAM: +400MB
+        SBI_Load --> SBI_Infer : Sequential Batching\nVRAM: +400MB
         SBI_Infer --> SBI_Unload
         SBI_Unload --> FREQ_Load : del model\nempty_cache()\nVRAM: back to 0
-        FREQ_Load --> FREQ_Infer : VRAM: +400MB
+        FREQ_Load --> FREQ_Infer : Sequential Batching\nVRAM: +400MB
         FREQ_Infer --> FREQ_Unload
         FREQ_Unload --> [*] : del model\nempty_cache()\nVRAM: back to 0
     }
 
-    GPU_PHASE --> CONFIDENCE_CHECK_2 : All GPU tools done\nVRAM: 0 GB
+    GPU_PHASE --> CONFIDENCE_CHECK_2 : All GPU tools done for all faces\nVRAM: 0 GB
 
     state CONFIDENCE_CHECK_2 <<choice>>
     CONFIDENCE_CHECK_2 --> SYNTHESIS : Any confidence threshold
@@ -458,7 +460,7 @@ stateDiagram-v2
 
     state LLM_PHASE {
         [*] --> OllamaCall
-        OllamaCall --> TokenStream : Phi-3 Mini generates\nOllama process: 1.8GB RAM
+        OllamaCall --> TokenStream : Phi-3 Mini generates text\nIdentities partitioned\nOllama process: 1.8GB RAM
         TokenStream --> JSONParse : Tokens stream to UI
         JSONParse --> [*]
         note right of OllamaCall : Separate OS process\nDoes NOT use PyTorch VRAM
@@ -491,8 +493,9 @@ flowchart TD
         FE["Frame Extraction\nTorchCodec (GPU → CPU fallback)\nN frames at 30fps"]
         FD["Face Detection\nMediaPipeDetector\n(Frame 0 only)"]
         QS["Quality Snipe\nLaplacian sharpness\n5 frames → sharpest"]
-        FC["Face Crop\n224×224 from sharpest frame"]
-        NP["Native Patches\neye / hairline / jaw\n224×224 native res"]
+        SORT["CPU-SORT Tracker\nKalman + IoU\nMatches across frames"]
+        FC["Face Crop\n224×224 per tracked face"]
+        NP["Native Patches\neye / hairline / jaw\n224×224 per tracked face"]
         LM["478-pt Landmarks\nre-extracted on winning frame"]
     end
 
@@ -530,7 +533,8 @@ flowchart TD
 
     VID --> FE --> FD
     IMG --> FD
-    FD --> QS --> FC & NP & LM
+    FD --> QS --> SORT
+    SORT --> FC & NP & LM
 
     FC --> C2PA
     FE --> RPPG
@@ -571,7 +575,8 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  Step 1 │ OBSERVE   │ Agent receives "suspect_video.mp4"           │
-│         │           │ → Extracts metadata, detects 1 face          │
+│         │           │ → Extracts metadata, detects 2 faces finding │
+│         │           │   real foreground decoy + fake background.   │
 │         │           │ → Confidence: 0.50 (prior, no evidence yet)  │
 │                                                                     │
 │  Step 2 │ PLAN      │ Agent checks C2PA provenance first (cheap)   │
@@ -579,29 +584,32 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 │         │ UPDATE    │ → Cannot verify source. Continue analysis.   │
 │         │           │ → Confidence: 0.50 (unchanged)               │
 │                                                                     │
-│  Step 3 │ PLAN      │ "No provenance — run biological check"       │
-│         │ ACT       │ run_rppg() → Low Biological Energy           │
-│         │ UPDATE    │ → Liveness: False, SNR: 0.12, confidence: 0.1│
-│         │           │ → Agent confidence: 0.35 (leaning FAKE)      │
+│  Step 3 │ PLAN      │ "No provenance — loop biological check"      │
+│         │ ACT       │ run_rppg(Face_0) → Strong Biological Energy  │
+│         │           │ run_rppg(Face_1) → Low Biological Energy     │
+│         │ UPDATE    │ → Face_1 Liveness: False, SNR: 0.12          │
+│         │           │ → Agent confidence: 0.35 (leaning FAKE based │
+│         │           │   on the highest anomalous actor)            │
 │                                                                     │
-│  Step 4 │ REASON    │ "Low biological signal. Running remaining    │
-│         │           │  CPU tools to gather more evidence."         │
-│         │ ACT       │ run_dct() → double_quant: 0.82               │
-│         │           │ run_geometry() → geometry_score: 0.85        │
-│         │           │ run_illumination() → lighting_consistent: True│
+│  Step 4 │ REASON    │ "Low biological signal on Face_1. Running    │
+│         │           │  remaining CPU tools to gather more evidence."│
+│         │ ACT       │ run_dct(Face_0, Face_1) → double_quant: 0.82 │
+│         │           │ run_geo(Face_0, Face_1) → High geometry fake │
+│         │           │ run_illum(Face_0, Face_1) → lighting: True   │
 │         │ UPDATE    │ → Agent confidence: 0.45 (still leaning FAKE)│
 │                                                                     │
 │  Step 5 │ REASON    │ "CPU phase complete. Confidence < 0.85 so    │
 │         │           │  I must proceed to GPU phase. Loading CLIP." │
-│         │ ACT       │ run_clip_adapter() → High anomaly in hairline│
+│         │ ACT       │ run_clip_adapter([Face_0, Face_1]) → High    │
+│         │           │ anomaly in hairline for Face_1.              │
 │         │ UPDATE    │ → Anomaly score: 0.87, hotspot: hair region  │
 │         │           │ → Agent confidence: 0.82 (likely FAKE)       │
 │                                                                     │
-│  Step 6 │ REASON    │ "CLIP anomaly in hairline is consistent      │
-│         │           │  with diffusion model artifacts. One more    │
-│         │           │  check for high confidence."                 │
-│         │ ACT       │ run_freqnet() → GAN fingerprint detected     │
-│         │ UPDATE    │ → Artifact score: 0.91                       │
+│  Step 6 │ REASON    │ "CLIP anomaly in Subject 1's hairline is     │
+│         │           │  consistent with diffusion model artifacts.  │
+│         │           │  One more check for high confidence."        │
+│         │ ACT       │ run_freqnet([Face_0, Face_1]) → GAN detected │
+│         │ UPDATE    │ → Artifact score: 0.91 on Face_1             │
 │         │           │ → Agent confidence: 0.92 → EARLY STOP        │
 │                                                                     │
 │  Step 7 │ SYNTHESIZE│ Agent generates final verdict:               │
@@ -795,9 +803,9 @@ It provides dense 478 points mapping the full face topology, unifying the pipeli
 class MediaPipeDetector:
     def __init__(self):
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=True,     # Each call is an independent image
-            max_num_faces=1,            # Forensic context: primary face only
-            refine_landmarks=True,      # CRITICAL: enables iris nodes 468-477
+            static_image_mode=True,     # Each call treated as independent image
+            max_num_faces=config.preprocessing.max_subjects_to_analyze,  # Configurable up to N faces
+            refine_landmarks=True,      # CRITICAL: enables iris + attention mesh 468-477
                                         # Without this, nodes 468/473 do not exist
                                         # → IPD and corneal checks silently fail
             min_detection_confidence=0.5,
@@ -1589,11 +1597,11 @@ flowchart TD
 
     FREQ_RUN["Load FreqNet\n🖥️ GPU | 400MB VRAM\n~0.5s inference\n🖥️ Frequency neural card appears\ndel model + empty_cache()"]
 
-    FREQ_RUN --> ENSEMBLE["Weighted Ensemble Score\nAll tool scores aggregated\n🖥️ Score bars update live"]
+    FREQ_RUN --> ENSEMBLE["Weighted Ensemble Score (Per Face)\nHighest single-actor fake score wins\n🖥️ Score bars update live"]
 
     ENSEMBLE --> SYNTH
 
-    SYNTH["Build Forensic Summary Text\nAll scores → structured prompt\nNo images sent to LLM"]
+    SYNTH["Build Forensic Summary Text\nPartitioned by Identity (Subject 0, 1)\nNo images sent to LLM"]
 
     SYNTH --> LLM_STREAM["Phi-3 Mini via Ollama\n1.8GB — separate process\nTokens stream to UI\n~4-6 seconds\n🖥️ Text appears token by token"]
 
@@ -1935,13 +1943,31 @@ Aegis-X relies heavily on precise facial landmarks. We use a single, unified app
 ```python
 class MediaPipeDetector:
     def __init__(self):
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=True,     # Each call is an independent image
-            max_num_faces=1,
-            refine_landmarks=True,      # CRITICAL: enables iris nodes 468-477
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        self.face_mesh = None # Initialize as None, will be lazy-loaded
+
+    def _get_detector(self):
+        """Lazy load MediaPipe to avoid importing during CLI boot."""
+        if self.face_mesh is None:
+            import mediapipe as mp
+            # Assuming 'config' is available in the scope or passed
+            # For this example, I'll use a placeholder for config.preprocessing.max_subjects_to_analyze
+            # If config is not globally available, it needs to be imported or passed.
+            # For now, let's assume a default or a placeholder.
+            # If config is not defined, this will cause an error.
+            try:
+                import config # Assuming config module exists
+                max_subjects = config.preprocessing.max_subjects_to_analyze
+            except (ImportError, AttributeError):
+                max_subjects = 1 # Fallback if config not found or attribute missing
+
+            self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=False, # Changed from True for lazy loading context
+                max_num_faces=max_subjects,
+                refine_landmarks=True,      # CRITICAL: enables iris nodes 468-477
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        return self.face_mesh
 
     def detect(self, img_rgb: np.ndarray) -> tuple:
         """img_rgb must be (H, W, 3) uint8 RGB — MediaPipe expects RGB, not BGR."""
@@ -2051,19 +2077,25 @@ if landmarks_raw is None:
 
 # Step 5: Build ALL crops from the winning frame
 face_crop_224 = self._crop_align(winning_frame, landmarks, 224)
-face_crop_380 = self._crop_align(winning_frame, landmarks, 380)
-patches = self._extract_native_patches(winning_frame, landmarks)
+face_crop_380 = self._crop_align(winning_frame, face["landmarks"], 380)
+    patches = self._extract_native_patches(winning_frame, face["landmarks"])
+    
+    tracked_faces.append(TrackedFace(
+        identity_id=face["identity_id"],
+        landmarks=face["landmarks"],
+        trajectory_bboxes=face["trajectory_bboxes"],
+        face_crop_224=face_crop_224,
+        face_crop_380=face_crop_380,
+        patch_left_eye=patches[0],
+        patch_right_eye=patches[1],
+        patch_hairline=patches[2],
+        patch_jaw=patches[3]
+    ))
 
-# Step 6: Return — ALL frames pass to rPPG, only winning frame to GPU tools
+# Step 6: Return — ALL frames pass to rPPG, only winning frame crops to GPU tools
 return PreprocessResult(
     has_face=True,
-    landmarks=landmarks,
-    face_crop_224=face_crop_224,
-    face_crop_380=face_crop_380,
-    patch_left_eye=patches[0],
-    patch_right_eye=patches[1],
-    patch_hairline=patches[2],
-    patch_jaw=patches[3],
+    tracked_faces=tracked_faces,    # List of tracked identities mapping dynamic ROIs
     frames_30fps=frames,            # ALL frames for rPPG temporal signal
     selected_frame_index=best_idx,  # Diagnostic only
     original_media_type="video",
@@ -2081,14 +2113,14 @@ return PreprocessResult(
 | **Which frame feeds GPU tools** | ✅ **Yes** | Sharpest of 5 samples instead of Frame 0 |
 | VRAMLifecycleManager | ❌ No | Unaffected |
 | Agent loop / early stopping | ❌ No | Unaware of frame selection |
-| `PreprocessResult` output contract | ❌ No | Identical fields (plus diagnostic `selected_frame_index`) |
+| `PreprocessResult` output contract | ✅ Modified | Wraps identity properties into `list[TrackedFace]` with `trajectory_bboxes` for dynamic tracking. |
 
 **PreprocessResult Updates:**
 One new informational field has been added:
 - `selected_frame_index: int` — Index of the Quality Snipe winner (0 if image or fallback). Diagnostic only — no downstream tool reads this.
 
 **process_media() Flow Update:**
-> "If video: (1) extract all frames via `extract_frames` (`TorchCodec` if available, `cv2` fallback), (2) run MediaPipeDetector on up to the first 10 frames to establish the primary face bounding box, (3) run the Quality Snipe filter to select the sharpest frame from 5 evenly-spaced samples using Laplacian variance (<1ms, zero VRAM), (4) re-extract **478-point MediaPipe landmarks** on the winning frame, (5) build all crops and patches from the winning frame. ALL extracted frames pass through as `frames_30fps` for temporal tools (rPPG, temporal jitter)."
+> "If video: (1) extract all frames via `extract_frames` (`TorchCodec` if available, `cv2` fallback), (2) run MediaPipeDetector on up to the first 10 frames to establish tracked identities bounding boxes via CPU-SORT, (3) run the Quality Snipe filter to select the sharpest frame from 5 evenly-spaced samples using Laplacian variance (<1ms, zero VRAM), (4) re-extract **478-point MediaPipe landmarks** on the winning frame, (5) build all crops and patches from the winning frame per identity. ALL extracted frames pass through as `frames_30fps` for temporal tools (rPPG, temporal jitter)."
 
 > ⚠️ **CRITICAL:** Landmarks MUST be re-extracted on the winning frame. The face position shifts between frames (head tilt, slight movement). Reusing Frame 0's landmarks with the winning frame's pixels causes all landmark-based crops to be spatially misaligned with the actual face. No error is thrown — the crops silently contain wrong pixels.
 

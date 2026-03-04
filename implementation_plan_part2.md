@@ -89,16 +89,19 @@ This is Phase 2, Day 7. Today we implement the POS (Plane Orthogonal to Skin-ton
 - `RPPGTool(BaseForensicTool)`:
   - `@property tool_name`: return `"run_rppg"`
   - `def setup(self)`: No-op.
-   - `def _extract_forehead_roi(self, frame: np.ndarray, landmarks: np.ndarray) -> np.ndarray`:
-     Extract the forehead region using **MediaPipe dense upper-head polygon: nodes 10, 338, 297, 332, 284, 103, 67** (the upper hairline band). Compute bbox from these landmarks, clamp to image boundaries, return the cropped ROI.
-     **CRITICAL — Hair Occlusion Guardrail:** Because this ROI sits very high and dense, subjects with bangs (hair covering forehead) produce noisy high-variance signals that corrupt the POS algorithm. Before running POS, compute the **RGB variance** (standard deviation across all pixels in the ROI). If `np.std(roi_pixels) > 35.0`, the ROI is hair-contaminated — return `"AMBIGUOUS"` immediately without running POS. This prevents false NO_PULSE verdicts on subjects with bangs.
+   - `def _extract_forehead_roi(self, frame: np.ndarray, current_bbox: tuple, relative_forehead_box: tuple) -> np.ndarray`:
+     - Apply the `relative_forehead_box` proportional scalars (x_min%, y_min%, x_max%, y_max%) to the `current_bbox` `[x1, y1, x2, y2]`. Clamp to image boundaries. Return the cropped ROI.
+     - **CRITICAL — Hair Occlusion Guardrail:** Subjects with bangs (hair covering forehead) produce noisy high-variance signals that corrupt the POS algorithm. Before running POS, on the first frame's ROI, compute the **RGB variance**. If `np.std(roi_pixels) > 35.0`, the ROI is hair-contaminated — return `"AMBIGUOUS"` immediately.
    - `def _run_inference(self, input_data: dict) -> ToolResult`:
-     - `input_data` MUST contain `"frames_30fps"` (list of RGB frames at 30fps) AND `"landmarks"` (**478-point** MediaPipe landmarks from winning frame, shape `(478, 2)`).
+     - `input_data` MUST contain `"frames_30fps"` AND `"tracked_faces"`. Iterate over each `face` in `tracked_faces`. Ensure `face["trajectory_bboxes"]` exists.
      - Requirements: `min_frames = 90` (from `utils/thresholds.py`). If `<90`, return neutral result (`score=0.5, confidence=0.0`).
-     - **Step 0: Hair Occlusion Guardrail** — Call `_extract_forehead_roi` on Frame 0. If it returns `"AMBIGUOUS"`, immediately return `score=0.5, confidence=0.0, evidence_summary="Ambiguous: forehead ROI shows high texture variance (likely hair occlusion). Cannot extract rPPG signal."`
+     - **Step 0: Anchor Geometry** — Read the sharpest frame's `face["landmarks"]`. Compute the absolute bounding box of the MediaPipe upper hairline band (nodes `10, 338, 297, 332, 284, 103, 67`). Compute this box's proportional boundaries `relative_forehead_box` relative to the *overall face bounding box* for that specific anchored frame.
      - **Step 1: Extract temporal RGB signal**
-       For each frame, extract the forehead ROI using `_extract_forehead_roi` with the initial face bbox as a static cookie-cutter (not re-detecting per frame).
-       Compute spatial mean RGB values -> `(N, 3)` matrix.
+       For `f_idx, frame` in enumerate `frames_30fps`:
+         Get `curr_box = face["trajectory_bboxes"][f_idx]`.
+         Extract the dynamically tracked ROI using `_extract_forehead_roi(frame, curr_box, relative_forehead_box)`.
+         (If `f_idx == 0` and it returns `"AMBIGUOUS"`, break and return `score=0.5, confidence=0.0, evidence_summary="Ambiguous: hair occlusion."`)
+         Compute spatial mean RGB values -> `(N, 3)` matrix.
      - **Step 2: POS (Plane Orthogonal to Skin-tone) Algorithm**
        Sliding window of 1.6 seconds (48 frames at 30fps):
        - Normalize: `Cn = RGB[m:n] / mean(RGB[m:n])`
@@ -139,19 +142,25 @@ from core.tools.rppg_tool import RPPGTool
 def test_day7():
     tool = RPPGTool()
     
-    # Create fake "flatline" video data (100 frames of 50x50 RGB noise with 0 biological variation)
-    np.random.seed(42)
-    fake_frames = [np.random.randint(100, 110, (50, 50, 3), dtype=np.uint8) for _ in range(100)]
-    dummy_landmarks = np.zeros((478, 2))  # MediaPipe 478-point format
-    
-    result = tool.execute({"frames_30fps": fake_frames, "landmarks": dummy_landmarks})
-    
-    print(f"rPPG Output: Score={result.score}, Conf={result.confidence}")
-    print(f"Summary: {result.evidence_summary}")
-    
-    assert result.success is True
-    assert result.score > 0.8  # Should flag as fake due to flatline
-    print("✅ Day 7 rPPG tool correctly identified flatline synthetic data!")
+    def test_day7_rppg():
+        tool = RPPGTool()
+        tool.setup()
+        
+        # 90 frames of random noise
+        fake_frames = [np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8) for _ in range(90)]
+        dummy_trajectory = {i: (100, 100, 300, 300) for i in range(90)}
+        dummy_tracked_faces = [{"identity_id": 0, "landmarks": np.zeros((478, 2)), "trajectory_bboxes": dummy_trajectory}] 
+        
+        result = tool.execute({"frames_30fps": fake_frames, "tracked_faces": dummy_tracked_faces})
+        
+        assert result.success is True
+        # Noise should not contain a biological pulse
+        assert result.score > 0.8  # Should flag as fake due to flatline
+        print(f"rPPG Output: Score={result.score}, Conf={result.confidence}")
+        print(f"Summary: {result.evidence_summary}")
+        print("✅ Day 7 rPPG tool correctly identified flatline synthetic data!")
+        
+    test_day7_rppg()
 
 if __name__ == "__main__":
     test_day7()
@@ -185,9 +194,10 @@ This is Phase 2, Day 8. We are building the DCT Frequency Analysis Tool. By anal
 **Section C: Detailed Specifications**
 - `DCTTool(BaseForensicTool)`:
   - `@property tool_name`: return `"run_dct"`
-  - `def _run_inference(self, input_data: dict) -> ToolResult`:
-    1. Read `input_data["face_crop_224"]` (RGB numpy array).
-    2. Convert to grayscale float64 using `cv2.cvtColor`.
+    - `def _run_inference(self, input_data: dict) -> ToolResult`:
+    1. Read `input_data["tracked_faces"]` (list of dictionaries). Ensure each contains a `face_crop_224` numpy array. If list is missing or empty, return abstention.
+    2. Iterate over each `face` in `tracked_faces`. Get the `face_crop_224`.
+    3. Convert the RGB crop to grayscale using `cv2.cvtColor`.
     3. Ensure dimensions are divisible by 8 (pad or crop).
     4. Group into 8x8 blocks. Reshape the entire array: `blocks = image.reshape(h//8, 8, w//8, 8).transpose(0, 2, 1, 3)`.
     5. Apply 2D DCT on every block: `scipy.fft.dctn` (with `norm='ortho'`). DO NOT use 1D `scipy.fftpack.dct`.
@@ -200,7 +210,7 @@ This is Phase 2, Day 8. We are building the DCT Frequency Analysis Tool. By anal
     11. `evidence_summary`: "DCT analysis detected double-quantization artifacts indicating structural modification" or "Smooth DCT frequency distribution consistent with natural imagery."
 
 **Section D: Implementation Rules for That Day**
-- Use strictly `scipy.fft.dctn` for 2D transform processing.
+- Strictly use `scipy.fft.dctn` for 2D transform processing.
 - This is a mathematical transformation, handle zeros or `NaNs` safely (add `1e-10` to denominators).
 
 **Section E: Testing & Verification Steps**
@@ -222,8 +232,12 @@ def test_day8():
         for j in range(0, 224, 16):
             blocky_img[i:i+8, j:j+8] = 255
             
-    res_clean = tool.execute({"face_crop_224": clean_image})
-    res_blocky = tool.execute({"face_crop_224": blocky_img})
+    # Use dummy face format
+    dummy_tracked_faces_clean = [{"identity_id": 0, "face_crop_224": clean_image}]
+    dummy_tracked_faces_blocky = [{"identity_id": 0, "face_crop_224": blocky_img}]
+
+    res_clean = tool.execute({"tracked_faces": dummy_tracked_faces_clean})
+    res_blocky = tool.execute({"tracked_faces": dummy_tracked_faces_blocky})
     
     print(f"Clean Score: {res_clean.score}, Blocky Score: {res_blocky.score}")
     assert res_clean.success and res_blocky.success
@@ -264,7 +278,8 @@ This is Phase 2, Day 9. We are implementing 7 explicit anthropometric measuremen
 - `GeometryTool(BaseForensicTool)`:
   - `@property tool_name`: return `"run_geometry"`
   - `def _run_inference(self, input_data: dict) -> ToolResult`:
-    - Reads `landmarks` (np.ndarray of shape **[478, 2]**, MediaPipe pixel coordinates) from `input_data`. If None, return neutral result `score=0.5`.
+    - Reads `tracked_faces` from `input_data`. Iterate over each `face`. Extract `landmarks` (np.ndarray of shape **[478, 2]**, MediaPipe pixel coordinates). If missing, return neutral result `score=0.5`.
+    - Loop logic: compute metrics mapped to the highest scoring outlier among tracked identities.
     - Function: `def dist(a, b): return np.linalg.norm(np.array(a) - np.array(b))`
     - You MUST implement EXACTLY these **7 distinct checks** using `dist` with **MediaPipe landmark indices**:
       1. **IPD ratio**: `dist(landmarks[33], landmarks[263]) / dist(landmarks[234], landmarks[454])`. Uses MediaPipe outer iris centers (nodes 33/263), divided by jaw-width (234/454). Valid: 0.42 to 0.52.
@@ -316,7 +331,8 @@ def test_day9():
     landmarks[152] = [50, 100]    # chin
     landmarks[10]  = [50, 5]      # hairline top
     
-    result = tool.execute({"landmarks": landmarks})
+    dummy_tracked_faces = [{"identity_id": 0, "landmarks": landmarks}]
+    result = tool.execute({"tracked_faces": dummy_tracked_faces})
     print(f"Geometry Score: {result.score}")
     assert result.success is True
     assert "violations" in result.details
@@ -354,22 +370,23 @@ This is Phase 2, Day 10. We are using Horn's "Shape-from-Shading" logic to compa
 **Section C: Detailed Specifications**
 - `IlluminationTool(BaseForensicTool)`:
   - `@property tool_name`: return `"run_illumination"`
-  - `def _run_inference(self, input_data: dict) -> ToolResult`:
-    1. Read `input_data["face_crop_224"]` and `input_data["media_path"]`. If either missing, return neutral score.
-    2. Convert RGB crop to `YCrCb` and isolate the `Y` (Luma) channel.
-    3. `midpoint_x = 112` -> Since `face_crop_224` is centered and size 224, strictly slice down the middle to avoid misalignments with global coordinate spaces.
-    4. Calculate Face Lighting: Mean Luma of the Left side of the face (`image[:, :midpoint_x]`) vs Mean Luma of the Right side of the face (`image[:, midpoint_x:]`).
+    - `def _run_inference(self, input_data: dict) -> ToolResult`:
+    1. Read `input_data["tracked_faces"]`. For each `face`, read `face_crop_224` and `input_data["media_path"]`. If either missing, return neutral score.
+    2. Verify `run_corneal()` ran previously and didn't fail.
+    3. Convert RGB crop to `YCrCb` and isolate the `Y` (Luma) channel.
+    4. `midpoint_x = 112` -> Since `face_crop_224` is centered and size 224, strictly slice down the middle to avoid misalignments with global coordinate spaces.
+    5. Calculate Face Lighting: Mean Luma of the Left side of the face (`image[:, :midpoint_x]`) vs Mean Luma of the Right side of the face (`image[:, midpoint_x:]`).
        `face_grad = abs(face_l - face_r) / (face_l + face_r + 1e-6)`.
-    5. Interpret diffuse lighting: If `face_grad < 0.05`, the lighting is diffuse (straight-on flat lighting). Return `score=0.2` (typically real).
-     6. Calculate Scene Context: Extract the **bottom 20 rows** of the face crop as the context/neck region: `ctx_l = Y[-20:, :midpoint_x].mean()`, `ctx_r = Y[-20:, midpoint_x:].mean()`. Self-contained on the face crop -- no need to load the full frame.
-    7. Which is brighter?
+    6. Interpret diffuse lighting: If `face_grad < 0.05`, the lighting is diffuse (straight-on flat lighting). Return `score=0.2` (typically real).
+     7. Calculate Scene Context: Extract the **bottom 20 rows** of the face crop as the context/neck region: `ctx_l = Y[-20:, :midpoint_x].mean()`, `ctx_r = Y[-20:, midpoint_x:].mean()`. Self-contained on the face crop -- no need to load the full frame.
+    8. Which is brighter?
        `face_dom = "left" if face_l > face_r else "right"`
        `ctx_dom = "left" if ctx_l > ctx_r else "right"`
-    8. Calculate mismatch penalty:
+    9. Calculate mismatch penalty:
        - If `face_dom == ctx_dom`: `fake_score = face_grad * 0.20`
        - If mismatch (`!=`): `fake_score = 0.30 + (face_grad * 0.70)`
-    9. `confidence`: `min(0.9, face_grad * 10)` (High gradient = strong lighting = confident result).
-    10. `evidence_summary`: "Face illumination direction mismatches environmental scene context" or "Consistent lighting found."
+    10. `confidence`: `min(0.9, face_grad * 10)` (High gradient = strong lighting = confident result).
+    11. `evidence_summary`: "Face illumination direction mismatches environmental scene context" or "Consistent lighting found."
 
 **Section D: Implementation Rules for That Day**
 - Use standard `numpy` slicing to divide the face. Wait to do this until converting the image to grayscale/luma.
@@ -398,15 +415,16 @@ def test_day10():
     dummy_landmarks = np.zeros((68, 2))
     dummy_landmarks[27:34, 0] = 100  # Sets the midline X to 100
     
-    res = tool.execute({
+    dummy_tracked_faces = [{
+        "identity_id": 0,
         "face_crop_224": dummy_img,
         "landmarks": dummy_landmarks
-    })
-    
-    print(f"Illumination Mismatch Score: {res.score}")
-    assert res.success is True
+    }]
+    result = tool.execute({"tracked_faces": dummy_tracked_faces, "media_path": "fake.mp4"})
+    print(f"Illumination Mismatch Score: {result.score}")
+    assert result.success is True
     # The intentional mismatch should trigger a fake_score > 0.30
-    assert res.score > 0.30
+    assert result.score > 0.30
     print("✅ Day 10 Illumination tool caught the synthetic face-scene mismatch!")
 
 if __name__ == "__main__":
@@ -442,8 +460,8 @@ This is Phase 2, Day 10.5. We are building a physics-based corneal reflection co
 **Section C: Detailed Specifications**
 - `CornealTool(BaseForensicTool)`:
   - `@property tool_name`: return `"run_corneal"`
-  - `def _run_inference(self, input_data: dict) -> ToolResult`:
-    1. Read `input_data["face_crop_224"]` and `input_data["landmarks"]`. If either is None, return abstention (`score=0.0, error=True`).
+    - `def _run_inference(self, input_data: dict) -> ToolResult`:
+    1. Read `input_data["tracked_faces"]`. Iterate through `face`. Find `face_crop_224` and `landmarks`. If either is None, return abstention (`score=0.0, error=True`).
     2. Extract **iris center regions** using **MediaPipe iris nodes 468 (left iris center) and 473 (right iris center)**. Each iris node gives a pixel coordinate. Extract a **15×15 pixel box** centered on each iris node from the native-resolution face crop (scaled to crop coordinates first).
        - Do NOT use eye boundary points; these are not corneal center trackable positions.
     3. Within each 15×15 box, threshold for specular highlights (brightest pixels, top 2%).
@@ -475,7 +493,12 @@ def test_day10_5():
     dummy_landmarks[36:42] = [[40, 40], [45, 38], [50, 40], [45, 42], [40, 42], [42, 40]]
     dummy_landmarks[42:48] = [[60, 40], [65, 38], [70, 40], [65, 42], [60, 42], [62, 40]]
     
-    result = tool.execute({"face_crop_224": dummy_img, "landmarks": dummy_landmarks})
+    dummy_tracked_faces = [{
+        "identity_id": 0,
+        "face_crop_224": dummy_img,
+        "landmarks": dummy_landmarks
+    }]
+    result = tool.execute({"tracked_faces": dummy_tracked_faces})
     assert result.success  # Should not crash
     print(f"Corneal Score: {result.score}")
     print("✅ Day 10.5 Corneal tool executed without crash!")

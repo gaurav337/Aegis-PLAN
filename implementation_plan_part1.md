@@ -311,16 +311,18 @@ This is Phase 1, Day 4. We are leveraging **MediaPipe Face Mesh** (`refine_landm
 1. `PreprocessResult` dataclass:
    Fields exactly as follows:
    - `has_face`: bool
-   - `landmarks`: np.ndarray of shape **`[478, 2]`** (MediaPipe Face Mesh with `refine_landmarks=True`), or None
-     - Includes iris and pupil nodes 468–477, required by corneal and IPD checks.
-   - `face_crop_224`: np.ndarray (for CLIP/FreqNet), or None
-   - `face_crop_380`: np.ndarray (for SBI), or None
-   - `patch_left_periorbital`: np.ndarray (224x224, MediaPipe left-eye boundary nodes `33,133,160,159,158,144`), or None
-   - `patch_right_periorbital`: np.ndarray (224x224, MediaPipe right-eye boundary nodes `263,362,385,386,387,373`), or None
-   - `patch_nasolabial_left`: np.ndarray (224x224, MediaPipe nodes `92, 205, 216, 206`), or None
-   - `patch_nasolabial_right`: np.ndarray (224x224, MediaPipe nodes `322, 425, 436, 426`), or None
-   - `patch_hairline_band`: np.ndarray (224x224, MediaPipe hairline nodes `10, 338, 297, 332, 284, 103, 67`), or None
-   - `patch_chin_jaw`: np.ndarray (224x224, MediaPipe mandibular contour nodes `172,136,150,149,176,148,152,377,400,379,365`), or None
+   - `tracked_faces`: list[TrackedFace] (List of identified actors, up to `max_subjects_to_analyze`), containing:
+     - `identity_id`: int
+     - `landmarks`: np.ndarray of shape **`[478, 2]`** (MediaPipe Face Mesh with `refine_landmarks=True`)
+     - `trajectory_bboxes`: dict[int, tuple[int, int, int, int]] (A sequence mapping frame index -> `[x1, y1, x2, y2]` bounding box from CPU-SORT, crucial for tracking regions across video without re-running MediaPipe per frame)
+     - `face_crop_224`: np.ndarray (for CLIP/FreqNet)
+     - `face_crop_380`: np.ndarray (for SBI)
+     - `patch_left_periorbital`: np.ndarray (224x224, MediaPipe left-eye boundary nodes)
+     - `patch_right_periorbital`: np.ndarray (224x224, MediaPipe right-eye boundary nodes)
+     - `patch_nasolabial_left`: np.ndarray (224x224, MediaPipe left nasolabial fold)
+     - `patch_nasolabial_right`: np.ndarray (224x224, MediaPipe right nasolabial fold)
+     - `patch_hairline_band`: np.ndarray (224x224, MediaPipe upper forehead)
+     - `patch_chin_jaw`: np.ndarray (224x224, MediaPipe mandibular contour)
    - `frames_30fps`: list[np.ndarray], or None (All extracted frames if video)
    - `selected_frame_index`: int
    - `selected_frame_sharpness`: float
@@ -331,11 +333,11 @@ This is Phase 1, Day 4. We are leveraging **MediaPipe Face Mesh** (`refine_landm
      Initialize `mp.solutions.face_mesh.FaceMesh(
          static_image_mode=True,
          refine_landmarks=True,       # CRITICAL: enables iris nodes 468-477
-         max_num_faces=1,
+         max_num_faces=config.preprocessing.max_subjects_to_analyze,
          min_detection_confidence=0.5
      )`.
-   - `_get_landmarks(self, image: np.ndarray) -> np.ndarray | None`:
-     Call `mp_face_mesh.process(image_rgb)`. If `multi_face_landmarks` is populated, take the first result. Extract all 478 `(x, y)` coordinates as pixel values (multiply normalized coords by `W` and `H`). If the image contains multiple faces, select the face whose bounding-box area is largest. Return exactly `(478, 2)` float32 array, or `None` if no face detected.
+   - `_get_landmarks(self, image: np.ndarray) -> list[np.ndarray] | None`:
+     Call `mp_face_mesh.process(image_rgb)`. Extract all 478 `(x, y)` coordinates as pixel values for each detected face. If the image contains multiple faces, sort them by bounding-box area (largest first). Execute CPU-SORT (Kalman filter + Hungarian IoU) to assign stable track IDs to each face over multiple frames. Return a list of `(478, 2)` float32 arrays, or `None` if no face detected.
      **Edge cases:**
      - Extreme yaw (>60°): MediaPipe may still return partial landmarks. Always validate that nose-tip node 1 and jaw nodes 234/454 are within image bounds before using.
      - Return `None` cleanly if `multi_face_landmarks` is empty — do NOT crash.
@@ -358,11 +360,11 @@ This is Phase 1, Day 4. We are leveraging **MediaPipe Face Mesh** (`refine_landm
      Check if image or video. Use `utils.video.extract_frames` or `utils.image.load_image`.
      If video:
      1. Extract all frames using `extract_frames()`.
-     2. Search up to the first 10 frames with `_get_landmarks()` to establish the primary face bounding box.
-     3. Call `_select_sharpest_frame()` using that bounding box to find the sharpest frame.
-     4. **CRITICAL:** Call `_get_landmarks` again on the *winning* frame to fix sub-pixel shifts caused by motion. Pass the winning frame as a fresh `static_image_mode=True` image — do NOT reuse cached landmark state from the search phase.
+     2. Search up to the first 10 frames with `_get_landmarks()` to establish tracked identities (bounding boxes via CPU-SORT).
+     3. Call `_select_sharpest_frame()` using those bounding boxes to find the sharpest frame.
+     4. **CRITICAL:** Call `_get_landmarks` again on the *winning* frame to fix sub-pixel shifts caused by motion. Pass the winning frame as a fresh `static_image_mode=True` image.
      5. Store all raw frames in `frames_30fps` for temporal tools (rPPG needs all frames at 30fps for POS pulse extraction).
-     6. Build all subsequent crops/patches exclusively from the *winning frame*'s image and 478-point aligned landmarks.
+     6. Build all subsequent crops/patches exclusively from the *winning frame*'s image and 478-point aligned landmarks *for each tracked identity*.
      Populate and return the `PreprocessResult`.
 
 **Section D: Implementation Rules for That Day**

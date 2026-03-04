@@ -88,8 +88,8 @@ This is Phase 6, Day 24. We are building `app.py`.
   - Results viewing:
     - Top metric cards: Final Ensemble Probability, Execution Time, and LLM's Verdict string.
     - Create a 2-column layout:
-      - Left Col: The raw image/video.
-      - Right Col: Expandable accordions for each ToolResult executed. If the tool is a GPU tool, badge it as `[GPU]`. Show the score on a colored progress bar (Green=0, Red=100%).
+      - Left Col: The raw image/video with bounding boxes overlaid for each `TrackedFace`.
+      - Right Col: Expandable accordions for each Tracked Identity (`Subject 0`, `Subject 1`). Inside each accordion, display the `ToolResults` executed on that actor. If the tool is a GPU tool, badge it as `[GPU]`. Show the score on a colored progress bar (Green=0, Red=100%).
 
 **Section D: Implementation Rules for That Day**
 - Streamlit's async support can be tricky. You must wrap the `agent.analyze()` call properly using `asyncio.run()`.
@@ -144,7 +144,7 @@ This is Phase 6, Day 25. We are building `gradio_app.py`.
   - Layout:
     - Row 1: Upload box on the left, "Output Verdict" markdown box + JSON summary on the right.
     - Wrap the `agent.analyze` call in a wrapper function that takes the file path and returns strings/dataframes formatting the `AgentState`.
-  - Use `gr.Dataframe` to render the `ToolResults` in a clean table format.
+  - Use `gr.Dataframe` to render the `ToolResults` partitioned by `Tracked Identity` in a clean table format.
 
 **Section D: Implementation Rules for That Day**
 - Keep the interface dead simple. Upload -> Analyze -> Table + Text. Minimal states.
@@ -198,8 +198,8 @@ This is Phase 7, Day 26. We are writing the `pytest` scaffold and unit tests for
    
 2. `tests/test_utils.py`:
    - Test `utils.video.extract_frames`. Ensure fallback logic doesn't crash.
-   - Test `utils.preprocessing.Preprocessor._get_landmarks`. Test behavior when NO face is present.
-   - Test `utils.preprocessing.Preprocessor._select_sharpest_frame` works accurately.
+   - Test `utils.preprocessing.Preprocessor._get_landmarks`. Test behavior when NO face is present, and when tracking multiple identities (`max_subjects_to_analyze > 1`).
+   - Test `utils.preprocessing.Preprocessor._select_sharpest_frame` works accurately across `TrackedFaces`.
 
 3. `tests/test_ensemble.py`:
    - Bring over the logic from `test_day15.py` into formal `assert` statements within `pytest`.
